@@ -42,9 +42,8 @@ process.on("uncaughtException", (err) => {
 });
 const ORCHESTRATOR = AGENTS.find((a) => a.role === "orchestrator");
 
-// Trace persistence: runs are ALWAYS kept locally; Salesforce gets the trace only
-// per TRACE_TO_SF = "off" (default) | "milestones" | "full". Cases are always in SF.
-const TRACE_TO_SF = (process.env.TRACE_TO_SF || "full").toLowerCase();
+// Local run traces (memory + disk). SF trace is written by agents themselves
+// via log_trace_step → Agent_Action_Log__c and FeedItem — no harness toggle needed.
 const RUNS_DIR = join(dirname(fileURLToPath(import.meta.url)), "..", "runs");
 await mkdir(RUNS_DIR, { recursive: true });
 const runTraces = new Map(); // caseId -> [ trace rows ]
@@ -258,38 +257,8 @@ function stripAttributes(records = []) {
   });
 }
 
-// A trace row is a "milestone" (persisted to SF in milestones mode) when it's a
-// hand-off/system/human step, a gate, a decision, or an outcome — not routine chatter.
-function isMilestone(row) {
-  return (
-    row.milestone === true ||
-    (row.actorType && row.actorType !== "Agent") ||
-    (row.gate_type && row.gate_type !== "None") ||
-    (row.decision && row.decision !== "N/A") ||
-    ["Success", "Failed", "Partial"].includes(row.outcome)
-  );
-}
-
-async function sfInsertTrace(caseId, row) {
-  const fields = {
-    Case__c: caseId,
-    Step__c: row.step,
-    Actor__c: row.actor,
-    Actor_Type__c: row.actorType || "Agent",
-    Observation__c: row.finding,
-    Action_Taken__c: row.action,
-    Logged_At__c: row.ts,
-  };
-  if (row.stage) fields.Stage__c = row.stage;
-  if (typeof row.confidence === "number") fields.Confidence__c = row.confidence;
-  if (row.gate_type) fields.Gate_Type__c = row.gate_type;
-  if (row.decision) fields.Decision__c = row.decision;
-  if (row.outcome) fields.Outcome__c = row.outcome;
-  await sf.createRecord("Agent_Action_Log__c", fields);
-}
-
-// Single trace sink. ALWAYS records locally (memory + runs/<caseId>.json). Writes to
-// Salesforce only per TRACE_TO_SF (off | milestones | full).
+// Local trace sink — records to memory and runs/<caseId>.json for the UI.
+// SF trace (Agent_Action_Log__c + FeedItem) is written by the agents themselves.
 async function recordTrace(caseId, entry) {
   const list = runTraces.get(caseId) || [];
   const row = { step: list.length + 1, ts: new Date().toISOString(), actorType: "Agent", ...entry };
@@ -298,13 +267,6 @@ async function recordTrace(caseId, entry) {
   try {
     await writeFile(join(RUNS_DIR, `${caseId}.json`), JSON.stringify(list, null, 2));
   } catch {}
-  if (TRACE_TO_SF === "full" || (TRACE_TO_SF === "milestones" && isMilestone(row))) {
-    try {
-      await sfInsertTrace(caseId, row);
-    } catch (err) {
-      console.error("trace→SF failed:", err.message);
-    }
-  }
   return { step: row.step };
 }
 
