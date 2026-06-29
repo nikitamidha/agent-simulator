@@ -44,7 +44,7 @@ const ORCHESTRATOR = AGENTS.find((a) => a.role === "orchestrator");
 
 // Trace persistence: runs are ALWAYS kept locally; Salesforce gets the trace only
 // per TRACE_TO_SF = "off" (default) | "milestones" | "full". Cases are always in SF.
-const TRACE_TO_SF = (process.env.TRACE_TO_SF || "off").toLowerCase();
+const TRACE_TO_SF = (process.env.TRACE_TO_SF || "full").toLowerCase();
 const RUNS_DIR = join(dirname(fileURLToPath(import.meta.url)), "..", "runs");
 await mkdir(RUNS_DIR, { recursive: true });
 const runTraces = new Map(); // caseId -> [ trace rows ]
@@ -176,8 +176,76 @@ const LOG_TRACE_TOOL = {
     required: ["finding", "action"],
   },
 };
+const RETRIEVE_KNOWLEDGE_TOOL = {
+  name: "retrieve_knowledge",
+  description:
+    "Search the TechGuard knowledge base for SOPs, runbooks, SLA rules, thresholds, or escalation criteria relevant to a query. Use this mid-turn when you need guidance the injected context does not cover — e.g. a specific runbook step, a threshold value, or a compliance rule. Returns the top matching sections with citations.",
+  input_schema: {
+    type: "object",
+    properties: {
+      query: { type: "string", description: "A plain-English question or keyword phrase — e.g. 'CCTV recording stream stuck runbook' or 'Platinum SLA response time'." },
+      k: { type: "number", description: "Number of sections to return (1–8). Default 4." },
+    },
+    required: ["query"],
+  },
+};
+
+const HANDOFF_TO_AGENT_TOOL = {
+  name: "handoff_to_agent",
+  description:
+    "Delegate a specific task to another specialist agent and receive its response. Use when you have completed your phase and a different agent should handle the next step — e.g. Diagnostic hands off to Intake after detecting an anomaly, or Intake hands off to Resolution after triaging. The target agent runs in full and its reply is returned to you. Log a trace step before calling this to record the hand-off.",
+  input_schema: {
+    type: "object",
+    properties: {
+      agentId: {
+        type: "string",
+        description: "Id of the agent to activate. One of: diagnostic-agent | intake-agent | resolution-agent | communications-agent.",
+        enum: ["diagnostic-agent", "intake-agent", "resolution-agent", "communications-agent"],
+      },
+      task: {
+        type: "string",
+        description: "A concise plain-English brief for the target agent. Include the Case Id, the asset, and the specific action you need it to take.",
+      },
+    },
+    required: ["agentId", "task"],
+  },
+};
+
+const REQUEST_HUMAN_INPUT_TOOL = {
+  name: "request_human_input",
+  description:
+    "Pause the agent and ask a human operator a specific question before proceeding. Use when you lack information needed to act safely — e.g. which asset is affected, whether a risky runbook step is authorised, or if the situation is outside your confidence threshold. The question will be surfaced to the operator in the UI. Once called, stop and do not proceed until the answer arrives.",
+  input_schema: {
+    type: "object",
+    properties: {
+      question: {
+        type: "string",
+        description: "The specific question for the human operator. Be concise and unambiguous — one question per call.",
+      },
+      context: {
+        type: "string",
+        description: "Optional: a sentence of context explaining why you need this information and what you will do once you have it.",
+      },
+      urgency: {
+        type: "string",
+        description: "Optional: High | Medium | Low. Defaults to Medium.",
+        enum: ["High", "Medium", "Low"],
+      },
+    },
+    required: ["question"],
+  },
+};
+
 function buildTools(_agent) {
-  return [SF_QUERY_TOOL, LOG_TRACE_TOOL, SF_CREATE_TOOL, SF_UPDATE_TOOL];
+  return [
+    SF_QUERY_TOOL,
+    LOG_TRACE_TOOL,
+    SF_CREATE_TOOL,
+    SF_UPDATE_TOOL,
+    RETRIEVE_KNOWLEDGE_TOOL,
+    HANDOFF_TO_AGENT_TOOL,
+    REQUEST_HUMAN_INPUT_TOOL,
+  ];
 }
 
 // ---------------------------------------------------------------------------
@@ -295,9 +363,7 @@ function dataAccessContext(agent, ctx) {
     return `CUSTOMER DATABASE (mock — Salesforce not configured):\n${rows}`;
   }
   const parts = [
-    "SALESFORCE ORG ACCESS: live tools (salesforce_query + log_trace_step" +
-      (agent.role === "orchestrator" ? " + activate_agent" : " + salesforce_create/update") +
-      "). Read real records before acting; never invent data.",
+    "SALESFORCE ORG ACCESS: live tools — salesforce_query, salesforce_create, salesforce_update, log_trace_step, retrieve_knowledge, handoff_to_agent, request_human_input. Read real records before acting; never invent data.",
     "KEY OBJECTS & FIELDS:\n" + SCHEMA_SUMMARY,
     "ALLOWED PICKLIST VALUES (use these EXACTLY — do not invent values):\n" + PICKLISTS,
   ];
@@ -330,14 +396,7 @@ function dataAccessContext(agent, ctx) {
   return parts.join("\n\n");
 }
 
-function knowledgeContext(hits) {
-  if (!hits || hits.length === 0)
-    return "KNOWLEDGE BASE: no sections matched this turn. Do not invent runbooks/SLAs — escalate or ask.";
-  const blocks = hits.map((h, i) => `[${i + 1}] ${h.citation}\n${h.text}`).join("\n\n");
-  return `KNOWLEDGE BASE (authoritative; cite [n]):\n\n${blocks}`;
-}
-
-function buildSystem(agent, hits, ctx) {
+function buildSystem(agent, ctx) {
   const modeRules =
     agent.mode === "autonomous"
       ? "OPERATING MODE: AUTONOMOUS. Decide and act, then report; escalate only on your human trigger."
@@ -347,7 +406,7 @@ function buildSystem(agent, hits, ctx) {
     modeRules,
     dataAccessContext(agent, ctx),
     "END STATE: a ticket is done at Case.Stage__c='Resolved' (after a verified fix) and then 'Closed' (after closure comms). A specialist sets Case.Stage__c when it completes its part; the Orchestrator drives the ticket to this end state and then stops. Once a ticket is Resolved or Closed, autonomous agents do not run on it.",
-    knowledgeContext(hits),
+    "Use retrieve_knowledge to look up runbooks, SLA rules, and escalation criteria before acting. Do not invent procedures.",
     "Keep responses concise and operational.",
     `TICKET WRITING STYLE: When calling log_trace_step, write the 'finding' and 'action' fields in plain, human-readable English sentences — not technical key=value notation.
 - finding: Describe what you observed in simple sentences. Avoid raw field names like "Is_Anomaly=true" or "Status=Critical". Instead say what it means in plain terms. Put each distinct observation on its own line.
@@ -399,32 +458,73 @@ function makeExecutor(agent, ctx, proposed, onStep) {
       if (onStep) onStep({ type: "sf_write", agent: agent.name, op: "salesforce_update", sobject: input.sobject, recordId: input.recordId, fields: input.fields, caseId: ctx.caseId });
       return JSON.stringify(await sf.updateRecord(input.sobject, input.recordId, input.fields));
     }
+
+    if (name === "retrieve_knowledge") {
+      const k = Math.min(Math.max(1, input.k || 4), 8);
+      const hits = retrieve(input.query, { k });
+      if (!hits.length) return "No matching knowledge base sections found for that query.";
+      return hits.map((h, i) => `[${i + 1}] ${h.citation}\n${h.text}`).join("\n\n");
+    }
+
+    if (name === "handoff_to_agent") {
+      const target = getAgent(input.agentId);
+      if (!target) return `Unknown agent id: ${input.agentId}. Valid ids: diagnostic-agent, intake-agent, resolution-agent, communications-agent.`;
+      if (onStep) onStep({ type: "handoff", from: agent.name, to: target.name, caseId: ctx.caseId, task: input.task });
+      const { reply } = await runAgentTask(target, ctx, input.task, onStep);
+      return `[${target.name} response]\n${reply}`;
+    }
+
+    if (name === "request_human_input") {
+      const id = "input_" + Math.random().toString(36).slice(2, 9);
+      const gate = {
+        id,
+        type: "human_input",
+        op: "request_human_input",
+        agentId: agent.id,
+        agentName: agent.name,
+        sessionId: ctx.sessionId,
+        caseId: ctx.caseId,
+        accountId: ctx.accountId,
+        question: input.question,
+        context: input.context || null,
+        urgency: input.urgency || "Medium",
+        status: "pending",
+        askedAt: new Date().toISOString(),
+        // thread snapshot so the agent can resume mid-run when the answer arrives
+        _resumeAgent: agent,
+        _resumeCtx: ctx,
+        _resumeProposed: proposed,
+      };
+      pendingActions.set(id, gate);
+      proposed.push({ id, agentId: agent.id, agentName: agent.name, op: "request_human_input", question: input.question, context: input.context, urgency: input.urgency || "Medium" });
+      if (onStep) onStep({ type: "human_input_requested", agent: agent.name, caseId: ctx.caseId, question: input.question, urgency: gate.urgency, id });
+      return `HUMAN INPUT REQUESTED (id=${id}): "${input.question}". Stop and wait — do not proceed until the operator responds.`;
+    }
+
     return `Unknown tool: ${name}`;
   };
 }
 
 async function runAgentMessages(agent, messages, ctx, proposed, onStep) {
-  const hits = retrieve(lastUserText(messages), { k: 4 });
   const tools = SF_ON ? buildTools(agent) : undefined;
   const executeTool = SF_ON ? makeExecutor(agent, ctx, proposed, onStep) : undefined;
   const reply = await chat({
-    system: buildSystem(agent, hits, ctx),
+    system: buildSystem(agent, ctx),
     messages,
-    meta: { name: agent.name, mode: agent.mode, sources: hits.map((h, i) => ({ tag: i + 1, citation: h.citation })) },
+    meta: { name: agent.name, mode: agent.mode },
     tools,
     executeTool,
     maxSteps: agent.role === "orchestrator" ? 24 : 10,
     onStep,
   });
-  const sources = hits.map((h, i) => ({ tag: i + 1, citation: h.citation, score: h.score }));
-  return { reply, sources };
+  return { reply };
 }
 
 // Ephemeral run (orchestrator + specialist activations + approvals).
 async function runAgentTask(agent, ctx, task, onStep) {
   const proposed = [];
-  const { reply, sources } = await runAgentMessages(agent, [{ role: "user", content: task }], ctx, proposed, onStep);
-  return { reply, sources, proposedActions: proposed };
+  const { reply } = await runAgentMessages(agent, [{ role: "user", content: task }], ctx, proposed, onStep);
+  return { reply, sources: [], proposedActions: proposed };
 }
 
 // Build the run context for an existing Case (account + its assets).
@@ -591,68 +691,102 @@ const server = http.createServer(async (req, res) => {
       return sendJSON(res, 200, { trace: runTraces.get(caseId) || [], ...out });
     }
 
-    // Approve a pending HITL write: execute it, then the specialist verifies/logs.
-    if (req.method === "POST" && url.pathname === "/api/approve") {
-      const { actionId } = await readBody(req);
+    // Unified human-in-the-loop response endpoint.
+    // Handles all gate types: SF write approvals, human input answers, verify-and-close.
+    // Body: { actionId, decision: "approved"|"rejected", answer?, note? }
+    //   answer — free-text response for request_human_input gates
+    //   note   — optional operator note for rejections
+    if (req.method === "POST" && url.pathname === "/api/hitl-respond") {
+      const { actionId, decision, answer, note } = await readBody(req);
+      if (!actionId || !decision) return sendJSON(res, 400, { error: "actionId and decision required" });
       const action = pendingActions.get(actionId);
       if (!action) return sendJSON(res, 404, { error: "Unknown action" });
       if (action.status !== "pending") return sendJSON(res, 409, { error: `Action already ${action.status}` });
 
-      let result;
-      if (action.op === "salesforce_create") result = await sf.createRecord(action.input.sobject, action.input.fields);
-      else result = await sf.updateRecord(action.input.sobject, action.input.recordId, action.input.fields);
-      action.status = "approved";
-
+      action.status = decision;
       const agent = getAgent(action.agentId);
       const ctx = { sessionId: action.sessionId, caseId: action.caseId, accountId: action.accountId };
-      if (action.caseId)
-        await recordTrace(action.caseId, {
-          actor: agent.name,
-          actorType: "Human",
-          finding: `Operator approved the proposed ${action.op} on ${action.input.sobject}.`,
-          action: `Executed it (${JSON.stringify(result)}).`,
-          gate_type: "Approval",
-          decision: "Approved",
-          outcome: "Success",
-        });
       const onStep = (e) => wsEmit(action.sessionId, e);
-      const out = await runAgentTask(
-        ORCHESTRATOR,
-        ctx,
-        `On the active ticket (Case Id ${action.caseId}), the operator APPROVED and the system executed: ${action.op} on ${action.input.sobject} → ${JSON.stringify(result)}. ` +
-          `Resume coordinating: re-read the ticket and its trace, continue hand-offs, and drive it to its end state (Stage Resolved after a verified fix, then Closed after closure comms). Stop at the next human gate or once resolved.`,
-        onStep,
-      );
-      wsEmit(action.sessionId, { type: "done" });
-      return sendJSON(res, 200, { ok: true, result, trace: runTraces.get(action.caseId) || [], ...out });
-    }
+      let out;
 
-    if (req.method === "POST" && url.pathname === "/api/reject") {
-      const { actionId, note } = await readBody(req);
-      const action = pendingActions.get(actionId);
-      if (!action) return sendJSON(res, 404, { error: "Unknown action" });
-      if (action.status !== "pending") return sendJSON(res, 409, { error: `Action already ${action.status}` });
-      action.status = "rejected";
-      const agent = getAgent(action.agentId);
-      const ctx = { sessionId: action.sessionId, caseId: action.caseId, accountId: action.accountId };
-      if (action.caseId)
-        await recordTrace(action.caseId, {
-          actor: agent.name,
-          actorType: "Human",
-          finding: `Operator rejected the proposed ${action.op} on ${action.input.sobject}.`,
-          action: note ? `Reason: ${note}` : "No alternative executed.",
-          gate_type: "Approval",
-          decision: "Rejected",
-          outcome: "Pending",
-        });
-      const onStep = (e) => wsEmit(action.sessionId, e);
-      const out = await runAgentTask(
-        ORCHESTRATOR,
-        ctx,
-        `On the active ticket (Case Id ${action.caseId}), the operator REJECTED the proposed ${action.op} on ${action.input.sobject}.${note ? " Note: " + note : ""} ` +
-          `Re-plan via the specialists: propose an alternative path to resolution, or stop if nothing further is safe.`,
-        onStep,
-      );
+      // ── SF write gate (Approval) ──────────────────────────────────────────
+      if (action.op === "salesforce_create" || action.op === "salesforce_update") {
+        if (decision === "approved") {
+          const result = action.op === "salesforce_create"
+            ? await sf.createRecord(action.input.sobject, action.input.fields)
+            : await sf.updateRecord(action.input.sobject, action.input.recordId, action.input.fields);
+          if (action.caseId)
+            await recordTrace(action.caseId, {
+              actor: "Human",
+              actorType: "Human",
+              finding: `Operator approved ${action.op} on ${action.input.sobject}.`,
+              action: `Executed: ${JSON.stringify(result)}.`,
+              gate_type: "Approval",
+              decision: "Approved",
+              outcome: "Success",
+              milestone: true,
+            });
+          out = await runAgentTask(
+            agent,
+            ctx,
+            `The operator APPROVED your proposed ${action.op} on ${action.input.sobject}. ` +
+              `The system executed it → ${JSON.stringify(result)}. ` +
+              `Re-read the ticket, continue from where you left off, and drive it to resolution.`,
+            onStep,
+          );
+        } else {
+          if (action.caseId)
+            await recordTrace(action.caseId, {
+              actor: "Human",
+              actorType: "Human",
+              finding: `Operator rejected ${action.op} on ${action.input.sobject}.`,
+              action: note ? `Reason: ${note}` : "No alternative executed.",
+              gate_type: "Approval",
+              decision: "Rejected",
+              outcome: "Pending",
+              milestone: true,
+            });
+          out = await runAgentTask(
+            agent,
+            ctx,
+            `The operator REJECTED your proposed ${action.op} on ${action.input.sobject}.${note ? " Reason: " + note : ""} ` +
+              `Re-read the ticket and propose an alternative path to resolution, or escalate if nothing safe remains.`,
+            onStep,
+          );
+        }
+      }
+
+      // ── Human input gate (Inputs Required / Verify & Close) ──────────────
+      else if (action.op === "request_human_input") {
+        const humanAnswer = answer || (decision === "approved" ? "Confirmed." : note || "Request declined.");
+        if (action.caseId)
+          await recordTrace(action.caseId, {
+            actor: "Human",
+            actorType: "Human",
+            finding: `Human responded to agent question: "${action.question}"`,
+            action: humanAnswer,
+            gate_type: "Inputs Required",
+            decision: decision === "approved" ? "Approved" : "Rejected",
+            outcome: "Pending",
+            milestone: true,
+          });
+        // Resume the originating agent with the answer injected as context.
+        out = await runAgentTask(
+          action._resumeAgent || agent,
+          action._resumeCtx || ctx,
+          `The human operator has responded to your question.\n` +
+            `Question: "${action.question}"\n` +
+            `Answer: ${humanAnswer}\n\n` +
+            `Resume from where you left off using this answer. ` +
+            `If this was a Verify & Close confirmation, proceed to set the Case stage to Resolved and then hand off to the Communications Agent for closure.`,
+          onStep,
+        );
+      }
+
+      else {
+        return sendJSON(res, 400, { error: `Unhandled gate op: ${action.op}` });
+      }
+
       wsEmit(action.sessionId, { type: "done" });
       return sendJSON(res, 200, { ok: true, trace: runTraces.get(action.caseId) || [], ...out });
     }
