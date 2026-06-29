@@ -1,0 +1,14 @@
+# Secrets — never commit your real API key
+.env
+
+# Dependencies (none today, but just in case)
+node_modules/
+
+# Org data snapshots (may contain customer data)
+snapshots/
+
+# Local agent run traces
+runs/
+
+# OS / editor cruft
+.DS_Store

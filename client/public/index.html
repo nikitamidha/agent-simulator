@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Agent Simulator</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <h1>Agent Simulator</h1>
+      <span id="model-badge" class="badge">connecting…</span>
+      <button id="reset-org-btn" class="ghost topbar-action">Reset Org to Demo Data</button>
+    </header>
+
+    <main class="layout">
+      <!-- Left: pick one of four agents -->
+      <aside class="sidebar">
+        <h2>Agents</h2>
+        <div id="agent-list" class="agent-list"></div>
+
+        <h2>Customer DB</h2>
+        <p class="hint">Read-only data all agents can see. Seed it in
+          <code>server/database.js</code>.</p>
+        <div id="customer-list" class="customer-list"></div>
+      </aside>
+
+      <!-- Center: chat with the selected agent -->
+      <section class="chat">
+        <div class="chat-header">
+          <div>
+            <span id="active-agent-name">Select an agent</span>
+            <span id="active-agent-mode" class="mode-tag"></span>
+          </div>
+          <button id="reset-btn" class="ghost">Reset chat</button>
+        </div>
+
+        <div id="messages" class="messages"></div>
+
+        <form id="chat-form" class="composer">
+          <input
+            id="chat-input"
+            type="text"
+            placeholder="Message the agent…"
+            autocomplete="off"
+            disabled
+          />
+          <button type="submit" disabled>Send</button>
+        </form>
+      </section>
+
+      <!-- Right: inject events into the selected agent -->
+      <aside class="events">
+        <h2>Inject event</h2>
+        <p class="hint">
+          Opens a ticket (Case) for the chosen client and wakes the Orchestrator,
+          which routes it to the right specialist agents. Their findings, actions,
+          and hand-offs are written to the ticket's trace in Salesforce.
+        </p>
+        <label for="event-account">Client (Salesforce Account)</label>
+        <select id="event-account"><option>Loading accounts…</option></select>
+        <label for="event-preset">Preset</label>
+        <select id="event-preset">
+          <option value="Plano West camera C-07 (Controlled Substances Cage) shows a green heartbeat but its last footage write is 11 minutes stale.">
+            CCTV footage gap (Plano West)
+          </option>
+          <option value="Plano West clinical apps (check-in, X-rays, payments) are timing out, but general internet is fine. Router NS-PW is reachable.">
+            Network brownout (Plano West)
+          </option>
+          <option value="Allen Orthodontics booking site is returning 500 errors that started right after the 14:01 deploy.">
+            Web 500s after deploy (Allen)
+          </option>
+          <option value="Frisco Family Dental primary circuit is fully down (blackout). Note: this site has no backup path.">
+            Network blackout (Frisco)
+          </option>
+          <option value="__custom__">Custom…</option>
+        </select>
+
+        <textarea
+          id="event-text"
+          rows="4"
+          placeholder="Event description…"
+        ></textarea>
+        <button id="inject-btn" disabled>Inject event</button>
+        <div id="ticket-link" class="ticket-link"></div>
+      </aside>
+    </main>
+
+    <script src="/app.js"></script>
+  </body>
+</html>

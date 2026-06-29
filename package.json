@@ -1,0 +1,15 @@
+{
+  "name": "agent-simulator",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Local agent simulator: an HTML chat UI wired to four configurable backend agents (a mix of autonomous and human-in-the-loop), sharing a mock customer database, with the ability to inject events into agents.",
+  "scripts": {
+    "start": "node --env-file-if-exists=.env start.js",
+    "server": "node server/index.js",
+    "client": "node client/server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
