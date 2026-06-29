@@ -283,41 +283,71 @@ function sourcesHtml(sources) {
   return `<div class="sources"><div class="sources-label">📚 Knowledge base sources</div><ul>${items}</ul></div>`;
 }
 
-// Render proposed Salesforce writes (from human-in-the-loop agents) with
-// Approve / Reject controls. Once resolved, show the outcome instead of buttons.
+// Render HITL gates — SF write proposals and human input requests.
+// Once resolved, buttons are replaced with an outcome label.
 function actionsHtml(actions) {
   if (!actions || !actions.length) return "";
   const blocks = actions
     .map((a) => {
+      if (resolvedActions.has(a.id)) {
+        return `<div class="action resolved"><span class="act-done">✓ resolved</span></div>`;
+      }
+      if (a.op === "request_human_input") {
+        const urgencyClass = (a.urgency || "Medium").toLowerCase();
+        const ctx = a.context ? `<div class="action-context">${escapeHtml(a.context)}</div>` : "";
+        const answerInput = `<textarea class="hitl-answer" data-act="${a.id}" placeholder="Type your answer…" rows="2"></textarea>`;
+        return (
+          `<div class="action action-input urgency-${urgencyClass}">` +
+          `<div class="action-summary">🙋 Agent needs input <span class="urgency-badge">${escapeHtml(a.urgency || "Medium")}</span></div>` +
+          `<div class="action-question">${escapeHtml(a.question)}</div>` +
+          ctx +
+          answerInput +
+          `<div class="action-controls">` +
+          `<button class="approve" data-act="${a.id}">Send answer</button>` +
+          `<button class="reject ghost" data-act="${a.id}">Decline</button>` +
+          `</div></div>`
+        );
+      }
+      // SF write proposal
       const summary =
         a.op === "salesforce_update"
           ? `Update <strong>${escapeHtml(a.sobject)}</strong> ${escapeHtml(a.recordId || "")}`
           : `Create <strong>${escapeHtml(a.sobject)}</strong>`;
       const fields = escapeHtml(JSON.stringify(a.fields || {}, null, 0));
-      const controls = resolvedActions.has(a.id)
-        ? `<span class="act-done">resolved</span>`
-        : `<button class="approve" data-act="${a.id}">Approve</button>` +
-          `<button class="reject ghost" data-act="${a.id}">Reject</button>`;
-      return `<div class="action"><div class="action-summary">⚠️ Proposed write — needs approval: ${summary}</div><div class="action-fields">${fields}</div><div class="action-controls">${controls}</div></div>`;
+      return (
+        `<div class="action">` +
+        `<div class="action-summary">⚠️ Proposed write — needs approval: ${summary}</div>` +
+        `<div class="action-fields">${fields}</div>` +
+        `<div class="action-controls">` +
+        `<button class="approve" data-act="${a.id}">Approve</button>` +
+        `<button class="reject ghost" data-act="${a.id}">Reject</button>` +
+        `</div></div>`
+      );
     })
     .join("");
   return `<div class="actions">${blocks}</div>`;
 }
 
-// One delegated listener handles Approve/Reject on any rendered proposal.
+// Unified HITL response handler — routes all gate types through /api/hitl-respond.
 els.messages.addEventListener("click", async (e) => {
   const btn = e.target.closest("button.approve, button.reject");
   if (!btn) return;
   const actionId = btn.dataset.act;
   const isApprove = btn.classList.contains("approve");
-  resolvedActions.add(actionId); // hide buttons immediately
+  const decision = isApprove ? "approved" : "rejected";
+
+  // For human-input gates, grab the answer from the textarea.
+  const answerEl = els.messages.querySelector(`.hitl-answer[data-act="${actionId}"]`);
+  const answer = answerEl ? answerEl.value.trim() : undefined;
+
+  resolvedActions.add(actionId);
   renderMessages();
   const pending = thinking();
   try {
-    const res = await fetch(`${API}/api/${isApprove ? "approve" : "reject"}`, {
+    const res = await fetch(`${API}/api/hitl-respond`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ actionId }),
+      body: JSON.stringify({ actionId, decision, answer }),
     });
     const data = await res.json();
     pending.remove();
