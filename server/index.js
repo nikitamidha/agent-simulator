@@ -34,7 +34,6 @@ import { dirname, join } from "node:path";
 const PORT = process.env.AGENT_SIM_API_PORT || 4000;
 const SF_ON = sf.isConfigured();
 const ORCHESTRATOR = AGENTS.find((a) => a.role === "orchestrator");
-const SPECIALISTS = AGENTS.filter((a) => a.role !== "orchestrator");
 
 // Trace persistence: runs are ALWAYS kept locally; Salesforce gets the trace only
 // per TRACE_TO_SF = "off" (default) | "milestones" | "full". Cases are always in SF.
@@ -170,25 +169,8 @@ const LOG_TRACE_TOOL = {
     required: ["finding", "action"],
   },
 };
-const ACTIVATE_AGENT_TOOL = {
-  name: "activate_agent",
-  description:
-    "Activate a specialist agent to work the active ticket. Use to triage and to coordinate hand-offs. The specialist reads the Case, does its work, writes its own trace rows, and returns a summary.",
-  input_schema: {
-    type: "object",
-    properties: {
-      agentId: { type: "string", enum: SPECIALISTS.map((a) => a.id), description: "Which specialist to activate." },
-      task: { type: "string", description: "What you want this specialist to do for this ticket." },
-    },
-    required: ["agentId", "task"],
-  },
-};
-
-function buildTools(agent) {
-  const tools = [SF_QUERY_TOOL, LOG_TRACE_TOOL];
-  if (agent.role === "orchestrator") tools.push(ACTIVATE_AGENT_TOOL);
-  else tools.push(SF_CREATE_TOOL, SF_UPDATE_TOOL);
-  return tools;
+function buildTools(_agent) {
+  return [SF_QUERY_TOOL, LOG_TRACE_TOOL, SF_CREATE_TOOL, SF_UPDATE_TOOL];
 }
 
 // ---------------------------------------------------------------------------
@@ -199,15 +181,6 @@ function stripAttributes(records = []) {
     const { attributes, ...rest } = r;
     return rest;
   });
-}
-
-async function getCaseStage(caseId) {
-  try {
-    const r = await sf.query(`SELECT Stage__c FROM Case WHERE Id='${caseId}' LIMIT 1`);
-    return r.records[0] && r.records[0].Stage__c;
-  } catch {
-    return null;
-  }
 }
 
 // A trace row is a "milestone" (persisted to SF in milestones mode) when it's a
@@ -342,19 +315,11 @@ function dataAccessContext(agent, ctx) {
       'This account has no assets on record. If the incident needs an asset, log a trace step (action = "Inputs Required") and stop rather than inventing one.',
     );
   }
-  if (agent.role === "orchestrator") {
-    const roster = SPECIALISTS.map((a) => `  - ${a.id} (${a.layer}): ${a.description}`).join("\n");
-    parts.push(
-      "SPECIALISTS you can activate (activate_agent):\n" + roster +
-        "\nRoute Scoping & Triage first, then the matching domain specialist; coordinate hand-offs; stop at the first human-in-the-loop gate. Drive the ticket to its end state — Resolved (after a verified fix), then Closed (after closure comms) — then stop. Do not activate autonomous agents on a ticket that is already Resolved or Closed.",
-    );
-  } else {
-    parts.push(
-      agent.mode === "hitl"
-        ? "WRITE GATING: human-in-the-loop. salesforce_query and log_trace_step run freely; salesforce_create/salesforce_update are captured as proposals needing operator approval — propose, then summarize and stop."
-        : "WRITE GATING: autonomous. salesforce_create/salesforce_update execute immediately; keep actions reversible and in-scope, and log each via log_trace_step.",
-    );
-  }
+  parts.push(
+    agent.mode === "hitl"
+      ? "WRITE GATING: human-in-the-loop. salesforce_query and log_trace_step run freely; salesforce_create/salesforce_update are captured as proposals needing operator approval — propose, then summarize and stop."
+      : "WRITE GATING: autonomous. salesforce_create/salesforce_update execute immediately; keep actions reversible and in-scope, and log each via log_trace_step.",
+  );
   return parts.join("\n\n");
 }
 
@@ -367,11 +332,9 @@ function knowledgeContext(hits) {
 
 function buildSystem(agent, hits, ctx) {
   const modeRules =
-    agent.role === "orchestrator"
-      ? "ROLE: MANAGER. Coordinate; delegate specialist work via activate_agent; do not do it yourself."
-      : agent.mode === "autonomous"
-        ? "OPERATING MODE: AUTONOMOUS. Decide and act, then report; escalate only on your human trigger."
-        : "OPERATING MODE: HUMAN-IN-THE-LOOP. Propose and wait for approval before any external effect.";
+    agent.mode === "autonomous"
+      ? "OPERATING MODE: AUTONOMOUS. Decide and act, then report; escalate only on your human trigger."
+      : "OPERATING MODE: HUMAN-IN-THE-LOOP. Propose and wait for approval before any external effect.";
   return [
     agent.systemPrompt.trim(),
     modeRules,
@@ -401,24 +364,6 @@ function makeExecutor(agent, ctx, proposed, onStep) {
       if (!ctx.caseId) return "No active ticket — cannot log a trace step.";
       const { step } = await recordTrace(ctx.caseId, { actor: agent.name, finding: input.finding, action: input.action, stage: input.stage, confidence: input.confidence, gate_type: input.gate_type, decision: input.decision, outcome: input.outcome, milestone: input.milestone });
       return `Logged trace step ${step}.`;
-    }
-
-    if (name === "activate_agent") {
-      const spec = getAgent(input.agentId);
-      if (!spec || spec.role === "orchestrator") return `Unknown specialist: ${input.agentId}`;
-      if (onStep) onStep({ type: "activate_agent", specialist: spec.name, task: input.task });
-      // End state: once the ticket is Resolved/Closed, autonomous agents don't run on it.
-      if (ctx.caseId && spec.mode === "autonomous") {
-        const stage = await getCaseStage(ctx.caseId);
-        if (stage === "Resolved" || stage === "Closed")
-          return `Ticket is ${stage} — autonomous agents do not run on a resolved/closed ticket. Do not activate ${spec.name}; the ticket has reached its end state.`;
-      }
-      const sub = await runAgentTask(spec, ctx, input.task, onStep);
-      if (sub.proposedActions.length) proposed.push(...sub.proposedActions);
-      return (
-        `${spec.name} reported: ${sub.reply}` +
-        (sub.proposedActions.length ? " [This specialist PROPOSED a gated action awaiting operator approval — stop and report it.]" : "")
-      );
     }
 
     const isWrite = name === "salesforce_create" || name === "salesforce_update";
