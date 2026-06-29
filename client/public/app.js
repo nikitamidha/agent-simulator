@@ -18,6 +18,8 @@ const sessionId =
 let agents = [];
 let activeAgent = null;
 const transcripts = {}; // agentId -> array of {role, text}
+const sfWriteLogs = []; // all SF create/update events across all runs
+let activeTab = "chat";
 
 // --- DOM refs ---
 const els = {
@@ -28,6 +30,7 @@ const els = {
   activeName: document.getElementById("active-agent-name"),
   activeMode: document.getElementById("active-agent-mode"),
   messages: document.getElementById("messages"),
+  sfLogs: document.getElementById("sf-logs"),
   chatForm: document.getElementById("chat-form"),
   chatInput: document.getElementById("chat-input"),
   resetBtn: document.getElementById("reset-btn"),
@@ -65,6 +68,11 @@ function handleStreamEvent(event) {
     // Final reply is delivered via HTTP — the thinking node gets replaced there.
     return;
   }
+  if (event.type === "sf_write") {
+    sfWriteLogs.push({ ...event, ts: new Date().toISOString() });
+    renderSfLogs();
+    return;
+  }
   if (!activeThinkingNode) return;
 
   const stepsDiv = activeThinkingNode.querySelector(".thinking-steps");
@@ -85,6 +93,9 @@ function handleStreamEvent(event) {
       break;
     case "activate_agent":
       html = `<div class="ts-activate">⚡ Activating <strong>${escapeHtml(event.specialist || "")}</strong></div>`;
+      break;
+    case "feed_post":
+      html = `<div class="ts-feed-post">📝 <strong>${escapeHtml(event.agent || "")}</strong> → Salesforce Case feed (${escapeHtml(event.caseId || "")}): <em>${escapeHtml(event.body || "")}</em></div>`;
       break;
   }
 
@@ -121,6 +132,16 @@ els.resetOrgBtn.addEventListener("click", async () => {
     els.resetOrgBtn.disabled = false;
     els.resetOrgBtn.textContent = original;
   }
+});
+
+// --- Tab switching ---
+document.querySelector(".tab-bar").addEventListener("click", (e) => {
+  const btn = e.target.closest(".tab");
+  if (!btn) return;
+  activeTab = btn.dataset.tab;
+  document.querySelectorAll(".tab").forEach((t) => t.classList.toggle("active", t.dataset.tab === activeTab));
+  els.messages.classList.toggle("hidden", activeTab !== "chat");
+  els.sfLogs.classList.toggle("hidden", activeTab !== "sf-logs");
 });
 
 // --- Init ---
@@ -212,7 +233,10 @@ function renderMessages() {
     .map((m) => {
       if (m.role === "trace") return traceHtml(m.trace);
       const label = m.role === "user" ? "You" : activeAgent.name;
-      return `<div class="msg ${m.role}"><div class="role">${escapeHtml(label)}</div>${escapeHtml(m.text)}${sourcesHtml(m.sources)}${actionsHtml(m.actions)}</div>`;
+      const body = m.role === "agent"
+        ? `<div class="md-body">${marked.parse(m.text ?? "")}</div>`
+        : escapeHtml(m.text);
+      return `<div class="msg ${m.role}"><div class="role">${escapeHtml(label)}</div>${body}${sourcesHtml(m.sources)}${actionsHtml(m.actions)}</div>`;
     })
     .join("");
   els.messages.scrollTop = els.messages.scrollHeight;
@@ -433,6 +457,32 @@ function thinking() {
   els.messages.scrollTop = els.messages.scrollHeight;
   activeThinkingNode = node;
   return node;
+}
+
+function renderSfLogs() {
+  if (!sfWriteLogs.length) {
+    els.sfLogs.innerHTML = `<div class="sf-logs-empty">No Salesforce writes yet. Inject an event to see account updates here.</div>`;
+    return;
+  }
+  els.sfLogs.innerHTML = sfWriteLogs.map((e, i) => {
+    const opLabel = e.op === "salesforce_create" ? "CREATE" : "UPDATE";
+    const opClass = e.op === "salesforce_create" ? "sf-op-create" : "sf-op-update";
+    const fields = JSON.stringify(e.fields || {}, null, 2);
+    const time = new Date(e.ts).toLocaleTimeString();
+    return `<div class="sf-log-entry">
+      <div class="sf-log-header">
+        <span class="sf-log-num">#${i + 1}</span>
+        <span class="sf-op ${opClass}">${opLabel}</span>
+        <strong>${escapeHtml(e.sobject || "")}</strong>
+        ${e.recordId ? `<span class="sf-log-id">${escapeHtml(e.recordId)}</span>` : ""}
+        <span class="sf-log-agent">by ${escapeHtml(e.agent || "")}</span>
+        <span class="sf-log-time">${time}</span>
+        ${e.caseId ? `<span class="sf-log-case">Case: ${escapeHtml(e.caseId)}</span>` : ""}
+      </div>
+      <pre class="sf-log-fields">${escapeHtml(fields)}</pre>
+    </div>`;
+  }).join("");
+  if (activeTab === "sf-logs") els.sfLogs.scrollTop = els.sfLogs.scrollHeight;
 }
 
 function escapeHtml(s) {

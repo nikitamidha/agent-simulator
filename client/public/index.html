@@ -32,10 +32,17 @@
             <span id="active-agent-name">Select an agent</span>
             <span id="active-agent-mode" class="mode-tag"></span>
           </div>
+          <div class="tab-bar">
+            <button class="tab active" data-tab="chat">Chat</button>
+            <button class="tab" data-tab="sf-logs">SF Update Logs</button>
+          </div>
           <button id="reset-btn" class="ghost">Reset chat</button>
         </div>
 
         <div id="messages" class="messages"></div>
+        <div id="sf-logs" class="sf-logs hidden">
+          <div class="sf-logs-empty">No Salesforce writes yet. Inject an event to see account updates here.</div>
+        </div>
 
         <form id="chat-form" class="composer">
           <input
@@ -86,6 +93,7 @@
       </aside>
     </main>
 
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
     <script src="/app.js"></script>
   </body>
 </html>

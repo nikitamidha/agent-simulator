@@ -196,6 +196,11 @@ export async function ping() {
   return { ok: true, instanceUrl: session.instanceUrl, authMode: authMode() };
 }
 
+// Post a TextPost to the Chatter feed of a record (e.g. a Case).
+export async function postToFeed(parentId, body) {
+  return rest("POST", "/sobjects/FeedItem", { ParentId: parentId, Type: "TextPost", Body: body });
+}
+
 // Run an anonymous Apex file via the CLI (used by "Reset Org to Demo Data").
 export async function runApex(filePath) {
   let stdout;

@@ -33,6 +33,13 @@ import { dirname, join } from "node:path";
 
 const PORT = process.env.AGENT_SIM_API_PORT || 4000;
 const SF_ON = sf.isConfigured();
+
+process.on("unhandledRejection", (reason) => {
+  console.error("[unhandledRejection]", reason);
+});
+process.on("uncaughtException", (err) => {
+  console.error("[uncaughtException]", err);
+});
 const ORCHESTRATOR = AGENTS.find((a) => a.role === "orchestrator");
 
 // Trace persistence: runs are ALWAYS kept locally; Salesforce gets the trace only
@@ -342,6 +349,11 @@ function buildSystem(agent, hits, ctx) {
     "END STATE: a ticket is done at Case.Stage__c='Resolved' (after a verified fix) and then 'Closed' (after closure comms). A specialist sets Case.Stage__c when it completes its part; the Orchestrator drives the ticket to this end state and then stops. Once a ticket is Resolved or Closed, autonomous agents do not run on it.",
     knowledgeContext(hits),
     "Keep responses concise and operational.",
+    `TICKET WRITING STYLE: When calling log_trace_step, write the 'finding' and 'action' fields in plain, human-readable English sentences — not technical key=value notation.
+- finding: Describe what you observed in simple sentences. Avoid raw field names like "Is_Anomaly=true" or "Status=Critical". Instead say what it means in plain terms. Put each distinct observation on its own line.
+- action: Describe what you did or decided. Each distinct action should be on its own line. Avoid long run-on sentences that pack everything together.
+Example finding: "The camera at C-07 at Meridian Cold Storage shows a green heartbeat, but its footage telemetry has not written in 11 minutes. This is a classic recording stream stuck fault, not a full camera outage."
+Example action: "Classified this as a CCTV service line issue.\nMarked the incident as compliance-sensitive due to the controlled substance profile and compliance-critical site.\nSet priority to High given the Platinum SLA and low risk tolerance.\nAdvancing stage to Triaged."`,
   ].join("\n\n");
 }
 
@@ -363,6 +375,11 @@ function makeExecutor(agent, ctx, proposed, onStep) {
     if (name === "log_trace_step") {
       if (!ctx.caseId) return "No active ticket — cannot log a trace step.";
       const { step } = await recordTrace(ctx.caseId, { actor: agent.name, finding: input.finding, action: input.action, stage: input.stage, confidence: input.confidence, gate_type: input.gate_type, decision: input.decision, outcome: input.outcome, milestone: input.milestone });
+      if (SF_ON) {
+        const feedBody = `[${agent.name}] Finding: ${input.finding}\nAction: ${input.action}`;
+        if (onStep) onStep({ type: "feed_post", agent: agent.name, caseId: ctx.caseId, body: feedBody });
+        sf.postToFeed(ctx.caseId, feedBody).catch((err) => console.error("[FEED POST FAILED] Case", ctx.caseId, "—", err.message));
+      }
       return `Logged trace step ${step}.`;
     }
 
@@ -374,8 +391,14 @@ function makeExecutor(agent, ctx, proposed, onStep) {
       proposed.push({ id, agentId: agent.id, agentName: agent.name, op: name, sobject: input.sobject, recordId: input.recordId, fields: input.fields });
       return `PROPOSED (approval required, id=${id}): ${name} on ${input.sobject}. NOT executed — summarize and stop.`;
     }
-    if (name === "salesforce_create") return JSON.stringify(await sf.createRecord(input.sobject, input.fields));
-    if (name === "salesforce_update") return JSON.stringify(await sf.updateRecord(input.sobject, input.recordId, input.fields));
+    if (name === "salesforce_create") {
+      if (onStep) onStep({ type: "sf_write", agent: agent.name, op: "salesforce_create", sobject: input.sobject, fields: input.fields, caseId: ctx.caseId });
+      return JSON.stringify(await sf.createRecord(input.sobject, input.fields));
+    }
+    if (name === "salesforce_update") {
+      if (onStep) onStep({ type: "sf_write", agent: agent.name, op: "salesforce_update", sobject: input.sobject, recordId: input.recordId, fields: input.fields, caseId: ctx.caseId });
+      return JSON.stringify(await sf.updateRecord(input.sobject, input.recordId, input.fields));
+    }
     return `Unknown tool: ${name}`;
   };
 }
@@ -556,6 +579,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "POST" && url.pathname === "/api/run") {
       const { caseId, sessionId } = await readBody(req);
       if (!caseId || !sessionId) return sendJSON(res, 400, { error: "caseId and sessionId required" });
+      req.socket.setTimeout(300_000); // 5 min — agent runs can be long
       const onStep = (e) => wsEmit(sessionId, e);
       let out;
       try {

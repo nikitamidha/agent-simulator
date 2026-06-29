@@ -130,6 +130,17 @@ h2:first-child { margin-top: 0; }
   gap: 12px;
 }
 .msg { max-width: 80%; padding: 10px 14px; border-radius: 12px; line-height: 1.5; white-space: pre-wrap; font-size: 14px; }
+.msg .md-body { white-space: normal; }
+.msg .md-body p { margin: 0 0 8px; }
+.msg .md-body p:last-child { margin-bottom: 0; }
+.msg .md-body ul, .msg .md-body ol { margin: 0 0 8px 18px; padding: 0; }
+.msg .md-body li { margin-bottom: 2px; }
+.msg .md-body code { background: rgba(0,0,0,0.3); padding: 1px 5px; border-radius: 4px; font-size: 12px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+.msg .md-body pre { background: rgba(0,0,0,0.3); padding: 8px 10px; border-radius: 6px; overflow-x: auto; margin: 0 0 8px; }
+.msg .md-body pre code { background: none; padding: 0; font-size: 12px; }
+.msg .md-body strong { font-weight: 600; }
+.msg .md-body em { font-style: italic; }
+.msg .md-body h1, .msg .md-body h2, .msg .md-body h3 { margin: 4px 0 6px; font-size: 14px; font-weight: 600; }
 .msg.user { align-self: flex-end; background: var(--user); }
 .msg.agent { align-self: flex-start; background: var(--agent); border: 1px solid var(--border); }
 .msg.event { align-self: center; background: var(--event); border: 1px solid #5a4520; color: #f5c878; font-size: 13px; max-width: 90%; }
@@ -140,6 +151,28 @@ h2:first-child { margin-top: 0; }
 .msg .sources li { font-size: 12px; color: var(--muted); white-space: normal; }
 .msg .sources .src-tag { color: var(--accent); font-weight: 600; margin-right: 4px; }
 .empty { color: var(--muted); margin: auto; text-align: center; font-size: 14px; }
+.hidden { display: none !important; }
+
+/* Tab bar */
+.tab-bar { display: flex; gap: 4px; }
+.tab { background: none; border: none; border-bottom: 2px solid transparent; color: var(--muted); cursor: pointer; font-size: 13px; padding: 4px 12px; transition: color 0.15s, border-color 0.15s; }
+.tab:hover { color: var(--text); }
+.tab.active { color: var(--accent); border-bottom-color: var(--accent); font-weight: 600; }
+
+/* SF Update Logs tab */
+.sf-logs { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 10px; }
+.sf-logs-empty { color: var(--muted); margin: auto; text-align: center; font-size: 14px; }
+.sf-log-entry { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+.sf-log-header { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 8px 12px; background: var(--panel-2); font-size: 13px; }
+.sf-log-num { color: var(--muted); font-size: 11px; min-width: 24px; }
+.sf-op { font-size: 11px; font-weight: 700; padding: 2px 6px; border-radius: 4px; letter-spacing: 0.5px; }
+.sf-op-create { background: #1a3a1a; color: #5ecf7a; }
+.sf-op-update { background: #1a2e4a; color: #4f9cf9; }
+.sf-log-id { color: var(--muted); font-size: 11px; font-family: ui-monospace, monospace; }
+.sf-log-agent { color: var(--muted); font-size: 12px; margin-left: auto; }
+.sf-log-time { color: var(--muted); font-size: 11px; }
+.sf-log-case { color: var(--muted); font-size: 11px; font-family: ui-monospace, monospace; }
+.sf-log-fields { margin: 0; padding: 10px 12px; font-size: 12px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: #c9d6e3; white-space: pre-wrap; word-break: break-all; line-height: 1.5; }
 
 .composer { display: flex; gap: 8px; padding: 12px 16px; border-top: 1px solid var(--border); }
 .composer input { flex: 1; }
@@ -200,6 +233,8 @@ button.ghost { background: transparent; color: var(--muted); border: 1px solid v
 .ts-tool-call code, .ts-tool-result code { background: var(--panel-2); padding: 1px 5px; border-radius: 4px; font-size: 11.5px; }
 .ts-tool-result { color: var(--muted); white-space: normal; }
 .ts-activate { color: var(--auto); font-weight: 600; padding: 3px 0; }
+.ts-feed-post { color: #7ecfa0; white-space: normal; padding: 3px 0; }
+.ts-feed-post em { color: var(--muted); font-style: normal; }
 .ticket-badge { font-size: 13px; color: var(--accent); font-weight: 600; }
 
 /* Proposed Salesforce writes awaiting approval (human-in-the-loop) */
