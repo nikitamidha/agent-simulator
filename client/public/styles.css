@@ -191,6 +191,17 @@ button.ghost { background: transparent; color: var(--muted); border: 1px solid v
 .t-find { color: #cdd6e2; }
 .t-act { color: var(--muted); }
 
+/* Live thinking stream (WebSocket events during agent run) */
+.msg.thinking-stream { border: 1px solid #2a3a52; background: #141b24; }
+.thinking-steps { display: flex; flex-direction: column; gap: 5px; margin-top: 4px; font-size: 12.5px; }
+.thinking-pulse { color: var(--muted); font-style: italic; }
+.ts-thinking { color: #8ba8cc; line-height: 1.4; padding: 2px 0; white-space: normal; }
+.ts-tool-call { color: var(--accent); }
+.ts-tool-call code, .ts-tool-result code { background: var(--panel-2); padding: 1px 5px; border-radius: 4px; font-size: 11.5px; }
+.ts-tool-result { color: var(--muted); white-space: normal; }
+.ts-activate { color: var(--auto); font-weight: 600; padding: 3px 0; }
+.ticket-badge { font-size: 13px; color: var(--accent); font-weight: 600; }
+
 /* Proposed Salesforce writes awaiting approval (human-in-the-loop) */
 .msg .actions { margin-top: 10px; padding-top: 8px; border-top: 1px dashed var(--border); display: flex; flex-direction: column; gap: 8px; }
 .msg .action { background: rgba(245,158,11,0.10); border: 1px solid #5a4520; border-radius: 8px; padding: 8px 10px; }

@@ -4,6 +4,7 @@
 // ============================================================================
 
 const API = `http://${location.hostname}:4000`;
+const WS_URL = `ws://${location.hostname}:4000/ws`;
 
 // A per-browser-tab session id so each tab has its own conversation per agent.
 const sessionId =
@@ -37,6 +38,63 @@ const els = {
   ticketLink: document.getElementById("ticket-link"),
 };
 
+// ---------------------------------------------------------------------------
+//  WebSocket — live thinking stream from the agent server
+// ---------------------------------------------------------------------------
+let ws = null;
+let activeThinkingNode = null; // the DOM node currently showing streaming steps
+let thinkingSteps = [];        // accumulated HTML strings for that node
+
+function connectWebSocket() {
+  ws = new WebSocket(`${WS_URL}?sessionId=${sessionId}`);
+
+  ws.onmessage = (e) => {
+    try {
+      const event = JSON.parse(e.data);
+      handleStreamEvent(event);
+    } catch {}
+  };
+
+  // Reconnect automatically if the server restarts.
+  ws.onclose = () => setTimeout(connectWebSocket, 2000);
+  ws.onerror = () => {};
+}
+
+function handleStreamEvent(event) {
+  if (event.type === "done") {
+    // Final reply is delivered via HTTP — the thinking node gets replaced there.
+    return;
+  }
+  if (!activeThinkingNode) return;
+
+  const stepsDiv = activeThinkingNode.querySelector(".thinking-steps");
+  if (!stepsDiv) return;
+
+  let html = "";
+  switch (event.type) {
+    case "thinking":
+      if (event.text) {
+        html = `<div class="ts-thinking">💭 <strong>${escapeHtml(event.agent || "")}</strong>: ${escapeHtml(event.text.slice(0, 300))}${event.text.length > 300 ? "…" : ""}</div>`;
+      }
+      break;
+    case "tool_call":
+      html = `<div class="ts-tool-call">🔧 <strong>${escapeHtml(event.agent || "")}</strong> → <code>${escapeHtml(event.name)}</code></div>`;
+      break;
+    case "tool_result":
+      html = `<div class="ts-tool-result">✓ <code>${escapeHtml(event.name)}</code>: ${escapeHtml(event.preview || "")}</div>`;
+      break;
+    case "activate_agent":
+      html = `<div class="ts-activate">⚡ Activating <strong>${escapeHtml(event.specialist || "")}</strong></div>`;
+      break;
+  }
+
+  if (html) {
+    thinkingSteps.push(html);
+    stepsDiv.innerHTML = thinkingSteps.join("");
+    els.messages.scrollTop = els.messages.scrollHeight;
+  }
+}
+
 // --- Reset Org to Demo Data ---
 els.resetOrgBtn.addEventListener("click", async () => {
   if (
@@ -69,6 +127,7 @@ els.resetOrgBtn.addEventListener("click", async () => {
 init();
 
 async function init() {
+  connectWebSocket();
   await Promise.all([loadAgents(), loadCustomers()]);
   syncPreset();
 }
@@ -151,8 +210,6 @@ function renderMessages() {
   }
   els.messages.innerHTML = list
     .map((m) => {
-      if (m.role === "event")
-        return `<div class="msg event">${escapeHtml(m.text)}</div>`;
       if (m.role === "trace") return traceHtml(m.trace);
       const label = m.role === "user" ? "You" : activeAgent.name;
       return `<div class="msg ${m.role}"><div class="role">${escapeHtml(label)}</div>${escapeHtml(m.text)}${sourcesHtml(m.sources)}${actionsHtml(m.actions)}</div>`;
@@ -240,14 +297,16 @@ els.messages.addEventListener("click", async (e) => {
     });
     const data = await res.json();
     pending.remove();
+    activeThinkingNode = null;
     if (data.error) {
       push("agent", `Error: ${data.error}`);
     } else {
       push("agent", data.reply, data.sources, data.proposedActions);
-    pushTrace(data.trace);
+      pushTrace(data.trace);
     }
   } catch (err) {
     pending.remove();
+    activeThinkingNode = null;
     push("agent", `Request failed: ${err.message}`);
   }
 });
@@ -268,9 +327,11 @@ els.chatForm.addEventListener("submit", async (e) => {
     });
     const data = await res.json();
     pending.remove();
+    activeThinkingNode = null;
     push("agent", data.reply ?? `Error: ${data.error}`, data.sources, data.proposedActions);
   } catch (err) {
     pending.remove();
+    activeThinkingNode = null;
     push("agent", `Request failed: ${err.message}`);
   }
 });
@@ -298,9 +359,9 @@ els.injectBtn.addEventListener("click", async () => {
 
   els.injectBtn.disabled = true;
   els.ticketLink.innerHTML = "";
-  push("event", `Creating ticket from incident: "${text}"`);
 
   // Step 1 — create the ticket and show its Salesforce link immediately.
+  // No messages in the chat for this; only the ticket link is shown.
   let ticket;
   try {
     const res = await fetch(`${API}/api/event`, {
@@ -317,18 +378,16 @@ els.injectBtn.addEventListener("click", async () => {
     ticket = data.ticket;
     if (ticket.url)
       els.ticketLink.innerHTML = `<a href="${ticket.url}" target="_blank" rel="noopener">🎫 ${escapeHtml(ticket.caseNumber)} — open in Salesforce ↗</a>`;
-    push(
-      "event",
-      `🎫 Ticket ${ticket.caseNumber} created for ${ticket.account} (${ticket.serviceLine || "unclassified"}). Handing Case Id ${ticket.caseId} to the Orchestrator…`,
-    );
-    pushTrace(data.trace);
+    else if (ticket.caseNumber)
+      els.ticketLink.innerHTML = `<span class="ticket-badge">🎫 ${escapeHtml(ticket.caseNumber)} created</span>`;
   } catch (err) {
     push("agent", `Ticket creation failed: ${err.message}`);
     els.injectBtn.disabled = false;
     return;
   }
 
-  // Step 2 — run the Orchestrator on the ticket (it queries the Case itself).
+  // Step 2 — run the Orchestrator on the ticket.
+  // Thinking steps stream in live via WebSocket; final reply arrives via HTTP.
   const pending = thinking();
   try {
     const res = await fetch(`${API}/api/run`, {
@@ -338,10 +397,12 @@ els.injectBtn.addEventListener("click", async () => {
     });
     const data = await res.json();
     pending.remove();
+    activeThinkingNode = null;
     push("agent", data.reply ?? `Error: ${data.error}`, data.sources, data.proposedActions);
     pushTrace(data.trace);
   } catch (err) {
     pending.remove();
+    activeThinkingNode = null;
     push("agent", `Agent run failed: ${err.message}`);
   } finally {
     els.injectBtn.disabled = false;
@@ -362,11 +423,15 @@ els.resetBtn.addEventListener("click", async () => {
 
 // --- Helpers ---
 function thinking() {
+  thinkingSteps = [];
   const node = document.createElement("div");
-  node.className = "msg agent";
-  node.innerHTML = `<div class="role">${escapeHtml(activeAgent.name)}</div><em>thinking…</em>`;
+  node.className = "msg agent thinking-stream";
+  node.innerHTML =
+    `<div class="role">${escapeHtml(activeAgent?.name ?? "Agent")}</div>` +
+    `<div class="thinking-steps"><em class="thinking-pulse">Working…</em></div>`;
   els.messages.appendChild(node);
   els.messages.scrollTop = els.messages.scrollHeight;
+  activeThinkingNode = node;
   return node;
 }
 

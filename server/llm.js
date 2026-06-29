@@ -3,7 +3,7 @@
 // ============================================================================
 //
 //  - If ANTHROPIC_API_KEY is set, calls the real Claude Messages API
-//    (default model: claude-opus-4-8) and runs an agentic TOOL LOOP so the
+//    (default model: claude-sonnet-4-6) and runs an agentic TOOL LOOP so the
 //    agent can read/write Salesforce via the tools passed in by index.js.
 //  - If it is NOT set, falls back to a deterministic MOCK so the simulator
 //    still runs end-to-end with zero setup.
@@ -19,8 +19,9 @@ export const usingRealModel = Boolean(API_KEY);
 // Runs one agent turn. If `tools` + `executeTool` are provided, loops:
 //   call model -> if it requests tools, execute them, feed results back -> repeat
 // until the model produces a final text answer (or maxSteps is hit).
-// Returns the final assistant text (string).
-export async function chat({ system, messages, meta, tools, executeTool, maxSteps = 8 }) {
+// `onStep` (optional) is called with streaming events so the UI can show live
+// thinking states: { type: 'thinking'|'tool_call'|'tool_result', agent, ... }
+export async function chat({ system, messages, meta, tools, executeTool, maxSteps = 8, onStep }) {
   if (!API_KEY) return mockReply({ messages, meta });
 
   // No tools wired (e.g. Salesforce not configured): single completion.
@@ -35,25 +36,39 @@ export async function chat({ system, messages, meta, tools, executeTool, maxStep
   for (let step = 0; step < maxSteps; step++) {
     const data = await callClaude({ system, messages: work, tools });
 
+    // Emit any text blocks that accompany tool calls as "thinking" events.
+    if (onStep && data.stop_reason === "tool_use") {
+      for (const block of data.content) {
+        if (block.type === "text" && block.text.trim()) {
+          onStep({ type: "thinking", agent: meta?.name, text: block.text.trim() });
+        }
+      }
+    }
+
     if (data.stop_reason !== "tool_use") return textOf(data) || "(no response)";
 
     work.push({ role: "assistant", content: data.content });
 
-    const results = [];
-    for (const block of data.content) {
-      if (block.type !== "tool_use") continue;
-      let out;
-      try {
-        out = await executeTool(block.name, block.input);
-      } catch (e) {
-        out = `ERROR: ${e.message}`;
-      }
-      results.push({
-        type: "tool_result",
-        tool_use_id: block.id,
-        content: typeof out === "string" ? out : JSON.stringify(out),
-      });
-    }
+    // Execute all tool calls in this response in parallel for speed.
+    const toolBlocks = data.content.filter((b) => b.type === "tool_use");
+    const results = await Promise.all(
+      toolBlocks.map(async (block) => {
+        if (onStep) onStep({ type: "tool_call", agent: meta?.name, name: block.name, input: block.input });
+        let out;
+        try {
+          out = await executeTool(block.name, block.input);
+        } catch (e) {
+          out = `ERROR: ${e.message}`;
+        }
+        const preview = String(out).slice(0, 200);
+        if (onStep) onStep({ type: "tool_result", agent: meta?.name, name: block.name, preview });
+        return {
+          type: "tool_result",
+          tool_use_id: block.id,
+          content: typeof out === "string" ? out : JSON.stringify(out),
+        };
+      }),
+    );
     work.push({ role: "user", content: results });
   }
 
@@ -70,7 +85,7 @@ function textOf(data) {
 }
 
 async function callClaude({ system, messages, tools }) {
-  const body = { model: MODEL, max_tokens: 1500, system, messages };
+  const body = { model: MODEL, max_tokens: 4096, system, messages };
   if (tools && tools.length) body.tools = tools;
 
   const res = await fetch("https://api.anthropic.com/v1/messages", {

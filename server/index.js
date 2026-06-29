@@ -13,12 +13,15 @@
 //  Endpoints:
 //    GET  /api/agents      GET /api/customers   GET /api/knowledge   GET /api/health
 //    POST /api/chat   { agentId, sessionId, message }     -> direct chat with one agent
-//    POST /api/event  { accountId, sessionId, event }     -> orchestrated ticket run
+//    POST /api/event  { accountId, sessionId, event }     -> create ticket only
+//    POST /api/run    { caseId, sessionId }               -> orchestrated agent run
 //    POST /api/approve { actionId }    POST /api/reject { actionId, note }
 //    POST /api/reset  { agentId, sessionId }
+//    WS   /ws?sessionId=…                                 -> live thinking stream
 // ============================================================================
 
 import http from "node:http";
+import { createHash } from "node:crypto";
 import { AGENTS, getAgent } from "./agents.js";
 import { customers as mockCustomers } from "./database.js";
 import { chat, usingRealModel } from "./llm.js";
@@ -60,6 +63,38 @@ function historyFor(agentId, sessionId) {
 
 // Pending HITL write proposals.
 const pendingActions = new Map(); // id -> { id, agentId, sessionId, caseId, accountId, op, input, status }
+
+// ---------------------------------------------------------------------------
+//  WebSocket server (no external deps — raw Node TCP upgrade)
+// ---------------------------------------------------------------------------
+const wsClients = new Map(); // sessionId -> Set<socket>
+
+function wsFrame(opcode, payload = Buffer.alloc(0)) {
+  const len = payload.length;
+  let header;
+  if (len < 126) {
+    header = Buffer.from([0x80 | opcode, len]);
+  } else if (len < 65536) {
+    header = Buffer.alloc(4);
+    header[0] = 0x80 | opcode;
+    header[1] = 126;
+    header.writeUInt16BE(len, 2);
+  } else {
+    header = Buffer.alloc(10);
+    header[0] = 0x80 | opcode;
+    header[1] = 127;
+    header.writeBigUInt64BE(BigInt(len), 2);
+  }
+  return Buffer.concat([header, payload]);
+}
+
+function wsEmit(sessionId, event) {
+  const payload = Buffer.from(JSON.stringify(event));
+  const frame = wsFrame(0x1, payload); // text frame
+  for (const sock of wsClients.get(sessionId) || []) {
+    try { sock.write(frame); } catch {}
+  }
+}
 
 // ---------------------------------------------------------------------------
 //  Salesforce schema + tools
@@ -355,7 +390,7 @@ function lastUserText(messages) {
   return m ? String(m.content) : "";
 }
 
-function makeExecutor(agent, ctx, proposed) {
+function makeExecutor(agent, ctx, proposed, onStep) {
   return async (name, input) => {
     if (name === "salesforce_query") {
       const r = await sf.query(input.soql);
@@ -371,13 +406,14 @@ function makeExecutor(agent, ctx, proposed) {
     if (name === "activate_agent") {
       const spec = getAgent(input.agentId);
       if (!spec || spec.role === "orchestrator") return `Unknown specialist: ${input.agentId}`;
+      if (onStep) onStep({ type: "activate_agent", specialist: spec.name, task: input.task });
       // End state: once the ticket is Resolved/Closed, autonomous agents don't run on it.
       if (ctx.caseId && spec.mode === "autonomous") {
         const stage = await getCaseStage(ctx.caseId);
         if (stage === "Resolved" || stage === "Closed")
           return `Ticket is ${stage} — autonomous agents do not run on a resolved/closed ticket. Do not activate ${spec.name}; the ticket has reached its end state.`;
       }
-      const sub = await runAgentTask(spec, ctx, input.task);
+      const sub = await runAgentTask(spec, ctx, input.task, onStep);
       if (sub.proposedActions.length) proposed.push(...sub.proposedActions);
       return (
         `${spec.name} reported: ${sub.reply}` +
@@ -399,10 +435,10 @@ function makeExecutor(agent, ctx, proposed) {
   };
 }
 
-async function runAgentMessages(agent, messages, ctx, proposed) {
+async function runAgentMessages(agent, messages, ctx, proposed, onStep) {
   const hits = retrieve(lastUserText(messages), { k: 4 });
   const tools = SF_ON ? buildTools(agent) : undefined;
-  const executeTool = SF_ON ? makeExecutor(agent, ctx, proposed) : undefined;
+  const executeTool = SF_ON ? makeExecutor(agent, ctx, proposed, onStep) : undefined;
   const reply = await chat({
     system: buildSystem(agent, hits, ctx),
     messages,
@@ -410,15 +446,16 @@ async function runAgentMessages(agent, messages, ctx, proposed) {
     tools,
     executeTool,
     maxSteps: agent.role === "orchestrator" ? 24 : 10,
+    onStep,
   });
   const sources = hits.map((h, i) => ({ tag: i + 1, citation: h.citation, score: h.score }));
   return { reply, sources };
 }
 
 // Ephemeral run (orchestrator + specialist activations + approvals).
-async function runAgentTask(agent, ctx, task) {
+async function runAgentTask(agent, ctx, task, onStep) {
   const proposed = [];
-  const { reply, sources } = await runAgentMessages(agent, [{ role: "user", content: task }], ctx, proposed);
+  const { reply, sources } = await runAgentMessages(agent, [{ role: "user", content: task }], ctx, proposed, onStep);
   return { reply, sources, proposedActions: proposed };
 }
 
@@ -438,15 +475,14 @@ async function loadCaseCtx(caseId, sessionId) {
   return { sessionId, caseId, caseNumber: row.CaseNumber, account: row.Account && row.Account.Name, accountId: row.AccountId, assets };
 }
 
-// Run the Orchestrator on an existing ticket — it reads the Case from SF itself.
-async function orchestrateCase(caseId, sessionId) {
+// Run the Orchestrator on an existing ticket.
+async function orchestrateCase(caseId, sessionId, onStep) {
   const ctx = await loadCaseCtx(caseId, sessionId);
   return runAgentTask(
     ORCHESTRATOR,
     ctx,
-    `A new ticket ${ctx.caseNumber} (Case Id ${caseId}) was just created. ` +
-      `Read the Case from Salesforce (Subject, Description, Service_Line__c, Account, Asset) to learn the incident — ` +
-      `do not assume; query it. Then route it to the right specialist(s), coordinate hand-offs, and stop at any human approval gate.`,
+    `This is a new ticket created with ticket ID ${ctx.caseNumber} (Case Id: ${caseId}). Handle and triage it.`,
+    onStep,
   );
 }
 
@@ -455,7 +491,7 @@ async function runChatTurn(agent, sessionId) {
   const history = historyFor(agent.id, sessionId);
   const proposed = [];
   const ctx = { sessionId, caseId: null, accountId: null };
-  const { reply, sources } = await runAgentMessages(agent, history, ctx, proposed);
+  const { reply, sources } = await runAgentMessages(agent, history, ctx, proposed, null);
   history.push({ role: "assistant", content: reply });
   return { reply, sources, proposedActions: proposed };
 }
@@ -548,9 +584,8 @@ const server = http.createServer(async (req, res) => {
       return sendJSON(res, 200, await runChatTurn(agent, sessionId));
     }
 
-    // Inject event -> create ticket -> Orchestrator routes & coordinates.
-    // Step 1: create the ticket and return it IMMEDIATELY (so the UI can show the
-    // record link right away). The agent run is a separate call (/api/run).
+    // Inject event -> create ticket and return it IMMEDIATELY (UI shows the record
+    // link right away). The agent run is a separate call (/api/run).
     if (req.method === "POST" && url.pathname === "/api/event") {
       const { event, sessionId, accountId } = await readBody(req);
       if (!event || !sessionId) return sendJSON(res, 400, { error: "event and sessionId required" });
@@ -571,16 +606,19 @@ const server = http.createServer(async (req, res) => {
       return sendJSON(res, 200, { ticket: tk, trace: runTraces.get(tk.caseId) || [] });
     }
 
-    // Step 2: run the Orchestrator on an existing ticket (it queries the Case itself).
+    // Run the Orchestrator on an existing ticket. Streams thinking via WebSocket
+    // to the session before returning the final reply over HTTP.
     if (req.method === "POST" && url.pathname === "/api/run") {
       const { caseId, sessionId } = await readBody(req);
       if (!caseId || !sessionId) return sendJSON(res, 400, { error: "caseId and sessionId required" });
+      const onStep = (e) => wsEmit(sessionId, e);
       let out;
       try {
-        out = await orchestrateCase(caseId, sessionId);
+        out = await orchestrateCase(caseId, sessionId, onStep);
       } catch (e) {
         out = { reply: `⚠️ Agent run could not start: ${e.message}`, sources: [], proposedActions: [] };
       }
+      wsEmit(sessionId, { type: "done" });
       return sendJSON(res, 200, { trace: runTraces.get(caseId) || [], ...out });
     }
 
@@ -608,12 +646,15 @@ const server = http.createServer(async (req, res) => {
           decision: "Approved",
           outcome: "Success",
         });
+      const onStep = (e) => wsEmit(action.sessionId, e);
       const out = await runAgentTask(
         ORCHESTRATOR,
         ctx,
         `On the active ticket (Case Id ${action.caseId}), the operator APPROVED and the system executed: ${action.op} on ${action.input.sobject} → ${JSON.stringify(result)}. ` +
           `Resume coordinating: re-read the ticket and its trace, continue hand-offs, and drive it to its end state (Stage Resolved after a verified fix, then Closed after closure comms). Stop at the next human gate or once resolved.`,
+        onStep,
       );
+      wsEmit(action.sessionId, { type: "done" });
       return sendJSON(res, 200, { ok: true, result, trace: runTraces.get(action.caseId) || [], ...out });
     }
 
@@ -635,12 +676,15 @@ const server = http.createServer(async (req, res) => {
           decision: "Rejected",
           outcome: "Pending",
         });
+      const onStep = (e) => wsEmit(action.sessionId, e);
       const out = await runAgentTask(
         ORCHESTRATOR,
         ctx,
         `On the active ticket (Case Id ${action.caseId}), the operator REJECTED the proposed ${action.op} on ${action.input.sobject}.${note ? " Note: " + note : ""} ` +
           `Re-plan via the specialists: propose an alternative path to resolution, or stop if nothing further is safe.`,
+        onStep,
       );
+      wsEmit(action.sessionId, { type: "done" });
       return sendJSON(res, 200, { ok: true, trace: runTraces.get(action.caseId) || [], ...out });
     }
 
@@ -669,8 +713,57 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
+// ---------------------------------------------------------------------------
+//  WebSocket upgrade handler
+// ---------------------------------------------------------------------------
+server.on("upgrade", (req, socket) => {
+  const url = new URL(req.url, "http://localhost");
+  if (url.pathname !== "/ws") return socket.destroy();
+  const key = req.headers["sec-websocket-key"];
+  if (!key) return socket.destroy();
+
+  const accept = createHash("sha1")
+    .update(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11")
+    .digest("base64");
+
+  socket.write(
+    "HTTP/1.1 101 Switching Protocols\r\n" +
+    "Upgrade: websocket\r\n" +
+    "Connection: Upgrade\r\n" +
+    `Sec-WebSocket-Accept: ${accept}\r\n\r\n`,
+  );
+
+  const sid = url.searchParams.get("sessionId") || "default";
+  if (!wsClients.has(sid)) wsClients.set(sid, new Set());
+  const clientSet = wsClients.get(sid);
+  clientSet.add(socket);
+
+  socket.on("data", (buf) => {
+    if (buf.length < 2) return;
+    const opcode = buf[0] & 0x0f;
+    if (opcode === 0x8) return socket.destroy(); // close frame
+    if (opcode === 0x9) {
+      // ping → pong (unmask client payload first)
+      const masked = (buf[1] & 0x80) !== 0;
+      const rawLen = buf[1] & 0x7f;
+      let offset = 2;
+      if (rawLen === 126) offset = 4;
+      else if (rawLen === 127) offset = 10;
+      const maskKey = masked ? buf.slice(offset, offset + 4) : null;
+      if (masked) offset += 4;
+      const payload = Buffer.from(buf.slice(offset, offset + rawLen));
+      if (masked && maskKey) for (let i = 0; i < payload.length; i++) payload[i] ^= maskKey[i % 4];
+      socket.write(wsFrame(0xa, payload));
+    }
+  });
+
+  socket.on("close", () => clientSet.delete(socket));
+  socket.on("error", () => clientSet.delete(socket));
+});
+
 server.listen(PORT, () => {
   console.log(`API server listening on http://localhost:${PORT}`);
+  console.log(`WebSocket: ws://localhost:${PORT}/ws?sessionId=<id>`);
   console.log(usingRealModel ? "Model: real Claude" : "Model: offline MOCK (set ANTHROPIC_API_KEY)");
   console.log(SF_ON ? "Salesforce: configured — live read/write" : "Salesforce: NOT configured (mock DB)");
   console.log(`Trace: local always (runs/); to Salesforce = ${TRACE_TO_SF}`);
