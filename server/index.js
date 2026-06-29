@@ -597,7 +597,7 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === "GET" && url.pathname === "/api/trace") {
       const caseId = url.searchParams.get("caseId");
-      return sendJSON(res, 200, { caseId, traceToSf: TRACE_TO_SF, trace: runTraces.get(caseId) || [] });
+      return sendJSON(res, 200, { caseId, trace: runTraces.get(caseId) || [] });
     }
 
     if (req.method === "GET" && url.pathname === "/api/knowledge") {
@@ -831,7 +831,7 @@ server.listen(PORT, () => {
   console.log(`WebSocket: ws://localhost:${PORT}/ws?sessionId=<id>`);
   console.log(usingRealModel ? "Model: real Claude" : "Model: offline MOCK (set ANTHROPIC_API_KEY)");
   console.log(SF_ON ? "Salesforce: configured — live read/write" : "Salesforce: NOT configured (mock DB)");
-  console.log(`Trace: local always (runs/); to Salesforce = ${TRACE_TO_SF}`);
+  console.log("Trace: local always (runs/); agents write SF trace via log_trace_step + FeedItem.");
   const kb = knowledgeStats();
   console.log(kb.ok ? `Knowledge base: ${kb.chunks} sections from ${kb.files} files` : `Knowledge base: EMPTY`);
 });
