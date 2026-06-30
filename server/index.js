@@ -163,8 +163,9 @@ const LOG_TRACE_TOOL = {
   input_schema: {
     type: "object",
     properties: {
-      finding: { type: "string", description: "One sentence: what you observed/found." },
-      action: { type: "string", description: "One sentence: the action you took from that finding." },
+      finding: { type: "string", description: "Human-readable summary of what you observed. Written for the UI — plain English, no raw IDs or field names." },
+      action: { type: "string", description: "Human-readable summary of what you did. Written for the UI — plain English, no raw IDs or field names." },
+      debug: { type: "string", description: "Optional. Raw technical detail for the audit log only — SF object IDs, exact field values, tool inputs/outputs, query results. Never shown in the UI." },
       stage: { type: "string", description: "Optional Case stage: Detected/Triaged/Diagnosing/Resolving/Gated/Resolved/Closed." },
       confidence: { type: "number", description: "Optional 0–100." },
       gate_type: { type: "string", description: "Optional: Approval/On-site/Verify & Close/Inputs Required/None." },
@@ -261,12 +262,18 @@ function stripAttributes(records = []) {
 // SF trace (Agent_Action_Log__c + FeedItem) is written by the agents themselves.
 async function recordTrace(caseId, entry) {
   const list = runTraces.get(caseId) || [];
-  const row = { step: list.length + 1, ts: new Date().toISOString(), actorType: "Agent", ...entry };
+  const { debug, ...uiEntry } = entry;
+  const row = { step: list.length + 1, ts: new Date().toISOString(), actorType: "Agent", ...uiEntry };
   list.push(row);
-  runTraces.set(caseId, list);
+  runTraces.set(caseId, list); // UI reads from here — no debug field
+
+  // Audit file includes debug field alongside the UI fields
+  const auditRow = debug ? { ...row, debug } : row;
+  const auditList = list.map((r, i) => (i === list.length - 1 ? auditRow : r));
   try {
-    await writeFile(join(RUNS_DIR, `${caseId}.json`), JSON.stringify(list, null, 2));
+    await writeFile(join(RUNS_DIR, `${caseId}.json`), JSON.stringify(auditList, null, 2));
   } catch {}
+  if (debug) console.log(`[TRACE DEBUG] Case ${caseId} step ${row.step}:`, debug);
   return { step: row.step };
 }
 
@@ -370,11 +377,36 @@ function buildSystem(agent, ctx) {
     "END STATE: a ticket is done at Case.Stage__c='Resolved' (after a verified fix) and then 'Closed' (after closure comms). A specialist sets Case.Stage__c when it completes its part; the Orchestrator drives the ticket to this end state and then stops. Once a ticket is Resolved or Closed, autonomous agents do not run on it.",
     "Use retrieve_knowledge to look up runbooks, SLA rules, and escalation criteria before acting. Do not invent procedures.",
     "Keep responses concise and operational.",
-    `TICKET WRITING STYLE: When calling log_trace_step, write the 'finding' and 'action' fields in plain, human-readable English sentences — not technical key=value notation.
-- finding: Describe what you observed in simple sentences. Avoid raw field names like "Is_Anomaly=true" or "Status=Critical". Instead say what it means in plain terms. Put each distinct observation on its own line.
-- action: Describe what you did or decided. Each distinct action should be on its own line. Avoid long run-on sentences that pack everything together.
-Example finding: "The camera at C-07 at Meridian Cold Storage shows a green heartbeat, but its footage telemetry has not written in 11 minutes. This is a classic recording stream stuck fault, not a full camera outage."
-Example action: "Classified this as a CCTV service line issue.\nMarked the incident as compliance-sensitive due to the controlled substance profile and compliance-critical site.\nSet priority to High given the Platinum SLA and low risk tolerance.\nAdvancing stage to Triaged."`,
+    `TRACE WRITING STYLE — applies to every log_trace_step call:
+Write every trace entry in Markdown. Use the section headers below. Be succinct — key takeaways only, no repetition, no raw field names.
+
+## Findings
+- One bullet per distinct observation.
+- Plain English only — never use key=value notation (e.g. say "The camera has not written footage in 11 minutes", not "telemetry_gap_mins=11").
+- If a tool produced this finding, note it in brackets at the end of the bullet: [tool: salesforce_query]
+
+## Actions Taken
+- One bullet per distinct action or decision.
+- State what was done and the brief reason or outcome.
+- If a tool was invoked, note it in brackets: [tool: salesforce_update]
+
+## Handoff (only if passing to another agent)
+- Name the next agent and state why in one sentence.
+- Example: "Handing off to Resolution Agent — runbook identified and ready to execute."
+
+## Debug (always populate this field)
+Raw technical detail for the audit log — not shown in the UI. Include here:
+- Salesforce object IDs (Case Id, Asset Id, Account Id, Record Ids)
+- Exact field names and values queried or written (e.g. Stage__c="Triaged", Confidence__c=85)
+- Tool inputs and outputs verbatim
+- Query results, record counts, raw API responses
+
+Rules:
+- Never merge findings and actions into one paragraph.
+- Never put raw IDs or field names in finding or action — those go in debug only.
+- Never repeat information already stated in a prior bullet.
+- Omit Findings/Actions/Handoff sections that have nothing to add.
+- Keep each bullet to one sentence where possible.`,
   ].join("\n\n");
 }
 
@@ -395,9 +427,18 @@ function makeExecutor(agent, ctx, proposed, onStep) {
 
     if (name === "log_trace_step") {
       if (!ctx.caseId) return "No active ticket — cannot log a trace step.";
-      const { step } = await recordTrace(ctx.caseId, { actor: agent.name, finding: input.finding, action: input.action, stage: input.stage, confidence: input.confidence, gate_type: input.gate_type, decision: input.decision, outcome: input.outcome, milestone: input.milestone });
+      const { step } = await recordTrace(ctx.caseId, { actor: agent.name, finding: input.finding, action: input.action, debug: input.debug, stage: input.stage, confidence: input.confidence, gate_type: input.gate_type, decision: input.decision, outcome: input.outcome, milestone: input.milestone });
+      if (onStep) onStep({ type: "trace_step", step, actor: agent.name, actorType: "Agent", finding: input.finding, action: input.action, stage: input.stage, milestone: input.milestone, confidence: input.confidence, outcome: input.outcome });
       if (SF_ON) {
-        const feedBody = `[${agent.name}] Finding: ${input.finding}\nAction: ${input.action}`;
+        // Strip markdown syntax (headers, bold, bullets) before posting to Salesforce feed.
+        const stripMd = (s = "") => s
+          .replace(/^#{1,6}\s+/gm, "")   // ## headers
+          .replace(/\*\*(.+?)\*\*/g, "$1") // **bold**
+          .replace(/\*(.+?)\*/g, "$1")     // *italic*
+          .replace(/^[-*]\s+/gm, "• ")    // bullet points
+          .replace(/\[tool:[^\]]+\]/g, "") // [tool: xyz] annotations
+          .trim();
+        const feedBody = `[${agent.name}]\nFinding: ${stripMd(input.finding)}\nAction: ${stripMd(input.action)}`;
         if (onStep) onStep({ type: "feed_post", agent: agent.name, caseId: ctx.caseId, body: feedBody });
         sf.postToFeed(ctx.caseId, feedBody).catch((err) => console.error("[FEED POST FAILED] Case", ctx.caseId, "—", err.message));
       }
@@ -476,7 +517,7 @@ async function runAgentMessages(agent, messages, ctx, proposed, onStep) {
     meta: { name: agent.name, mode: agent.mode },
     tools,
     executeTool,
-    maxSteps: agent.role === "orchestrator" ? 24 : 10,
+    maxSteps: agent.role === "orchestrator" ? 24 : 20,
     onStep,
   });
   return { reply };
@@ -636,21 +677,22 @@ const server = http.createServer(async (req, res) => {
       return sendJSON(res, 200, { ticket: tk, trace: runTraces.get(tk.caseId) || [] });
     }
 
-    // Run the Orchestrator on an existing ticket. Streams thinking via WebSocket
-    // to the session before returning the final reply over HTTP.
+    // Run the Orchestrator on an existing ticket. Returns 202 immediately;
+    // thinking steps and the final result are delivered via WebSocket so
+    // the browser fetch never needs to wait for the full agent run.
     if (req.method === "POST" && url.pathname === "/api/run") {
       const { caseId, sessionId } = await readBody(req);
       if (!caseId || !sessionId) return sendJSON(res, 400, { error: "caseId and sessionId required" });
-      req.socket.setTimeout(300_000); // 5 min — agent runs can be long
+      sendJSON(res, 202, { ok: true });
       const onStep = (e) => wsEmit(sessionId, e);
-      let out;
-      try {
-        out = await orchestrateCase(caseId, sessionId, onStep);
-      } catch (e) {
-        out = { reply: `⚠️ Agent run could not start: ${e.message}`, sources: [], proposedActions: [] };
-      }
-      wsEmit(sessionId, { type: "done" });
-      return sendJSON(res, 200, { trace: runTraces.get(caseId) || [], ...out });
+      orchestrateCase(caseId, sessionId, onStep)
+        .then((out) => {
+          wsEmit(sessionId, { type: "done", trace: runTraces.get(caseId) || [], ...out });
+        })
+        .catch((e) => {
+          wsEmit(sessionId, { type: "done", reply: `⚠️ Agent run failed: ${e.message}`, sources: [], proposedActions: [], trace: runTraces.get(caseId) || [] });
+        });
+      return;
     }
 
     // Unified human-in-the-loop response endpoint.

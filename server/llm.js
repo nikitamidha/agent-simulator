@@ -12,6 +12,38 @@
 // ============================================================================
 
 const MODEL = process.env.AGENT_SIM_MODEL || "claude-sonnet-4-6";
+
+function toolPreview(name, out) {
+  const s = typeof out === "string" ? out : JSON.stringify(out);
+  try {
+    if (name === "salesforce_query") {
+      const r = JSON.parse(s);
+      const n = r.totalSize ?? r.records?.length ?? "?";
+      if (n === 0) return "No records found";
+      const first = r.records?.[0] || {};
+      // Pick the most human-readable field available
+      const label = first.CaseNumber || first.Name || first.CaseNumber
+        || first.Signal_Type__c || first.Runbook_Key__c || first.Id || "";
+      return `${n} record${n !== 1 ? "s" : ""}${label ? ` — ${label}` : ""}`;
+    }
+    if (name === "salesforce_update" || name === "salesforce_create") {
+      const r = JSON.parse(s);
+      return r.success ? `OK — ${r.id || ""}` : `Failed: ${JSON.stringify(r.errors)}`;
+    }
+    if (name === "retrieve_knowledge") {
+      // First line is "[N] citation › ..." — extract just that
+      const firstLine = s.split("\n")[0].slice(0, 100);
+      return firstLine;
+    }
+    if (name === "log_trace_step") {
+      return s; // already short: "Logged trace step N."
+    }
+    if (name === "handoff_to_agent") {
+      return "Sub-agent response received";
+    }
+  } catch {}
+  return s.slice(0, 120);
+}
 const API_KEY = process.env.ANTHROPIC_API_KEY;
 
 export const usingRealModel = Boolean(API_KEY);
@@ -60,7 +92,7 @@ export async function chat({ system, messages, meta, tools, executeTool, maxStep
         } catch (e) {
           out = `ERROR: ${e.message}`;
         }
-        const preview = String(out).slice(0, 200);
+        const preview = toolPreview(block.name, out);
         if (onStep) onStep({ type: "tool_result", agent: meta?.name, name: block.name, preview });
         return {
           type: "tool_result",

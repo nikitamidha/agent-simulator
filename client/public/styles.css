@@ -155,11 +155,18 @@ h2:first-child { margin-top: 0; }
 
 /* Tab bar */
 .tab-bar { display: flex; gap: 4px; }
-.tab { background: none; border: none; border-bottom: 2px solid transparent; color: var(--muted); cursor: pointer; font-size: 13px; padding: 4px 12px; transition: color 0.15s, border-color 0.15s; }
+.tab { background: none; border: none; border-bottom: 2px solid transparent; color: var(--muted); cursor: pointer; font-size: 13px; padding: 4px 12px; transition: color 0.15s, border-color 0.15s; position: relative; }
 .tab:hover { color: var(--text); }
 .tab.active { color: var(--accent); border-bottom-color: var(--accent); font-weight: 600; }
+.tab.tab-badge::after { content: ""; position: absolute; top: 4px; right: 6px; width: 6px; height: 6px; border-radius: 50%; background: var(--auto); }
 
-/* SF Update Logs tab */
+/* Final Snapshot tab */
+.final-snapshot { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 12px; }
+.snapshot-empty { color: var(--muted); margin: auto; text-align: center; font-size: 14px; }
+.snapshot-reply { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 14px 16px; font-size: 13.5px; line-height: 1.6; }
+.run-complete-marker { font-size: 11px; color: #4e8c5a; font-weight: 500; padding: 6px 0 2px; }
+
+/* SFDC Update Logs tab */
 .sf-logs { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 10px; }
 .sf-logs-empty { color: var(--muted); margin: auto; text-align: center; font-size: 14px; }
 .sf-log-entry { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
@@ -215,26 +222,49 @@ button.ghost { background: transparent; color: var(--muted); border: 1px solid v
 .msg.trace { align-self: stretch; max-width: 100%; background: #14181f; border: 1px solid var(--border); }
 .trace-label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); margin-bottom: 8px; }
 .trace-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
-.trace-list li { display: flex; gap: 10px; }
+.trace-list li { display: flex; gap: 10px; align-items: flex-start; }
 .t-step { flex: 0 0 22px; height: 22px; border-radius: 50%; background: var(--panel-2); border: 1px solid var(--border); color: var(--muted); font-size: 11px; display: flex; align-items: center; justify-content: center; }
-.t-body { flex: 1; }
+.t-body { flex: 1; min-width: 0; }
 .t-actor { font-weight: 600; font-size: 13px; }
 .t-type { font-weight: 400; font-size: 10px; color: var(--muted); text-transform: uppercase; }
 .t-find, .t-act { font-size: 12.5px; color: var(--text); margin-top: 2px; line-height: 1.4; }
 .t-find { color: #cdd6e2; }
-.t-act { color: var(--muted); }
+.t-act { color: #cdd6e2; border-top: 1px solid var(--border); margin-top: 6px; padding-top: 6px; }
 
-/* Live thinking stream (WebSocket events during agent run) */
-.msg.thinking-stream { border: 1px solid #2a3a52; background: #141b24; }
-.thinking-steps { display: flex; flex-direction: column; gap: 5px; margin-top: 4px; font-size: 12.5px; }
-.thinking-pulse { color: var(--muted); font-style: italic; }
-.ts-thinking { color: #8ba8cc; line-height: 1.4; padding: 2px 0; white-space: normal; }
-.ts-tool-call { color: var(--accent); }
-.ts-tool-call code, .ts-tool-result code { background: var(--panel-2); padding: 1px 5px; border-radius: 4px; font-size: 11.5px; }
-.ts-tool-result { color: var(--muted); white-space: normal; }
-.ts-activate { color: var(--auto); font-weight: 600; padding: 3px 0; }
-.ts-feed-post { color: #7ecfa0; white-space: normal; padding: 3px 0; }
-.ts-feed-post em { color: var(--muted); font-style: normal; }
+/* Live run stream (WebSocket events during agent run) */
+.msg.run-stream { background: transparent; border: none; padding: 0; gap: 0; }
+.run-body { display: flex; flex-direction: column; gap: 10px; width: 100%; }
+
+/* Per-agent thinking <details> — ephemeral, collapsible */
+.thinking-block { border-left: 2px solid var(--border); padding-left: 10px; margin: 0; }
+.thinking-summary {
+  cursor: pointer; list-style: none;
+  font-size: 12px; color: var(--muted); font-weight: 500;
+  display: flex; align-items: center; gap: 6px;
+  padding: 3px 0; user-select: none;
+}
+.thinking-summary::-webkit-details-marker { display: none; }
+.thinking-summary::before { content: "▸"; font-size: 10px; color: var(--border); }
+.thinking-block[open] > .thinking-summary::before { content: "▾"; }
+.ts-agent-name { color: var(--accent); font-weight: 600; }
+.ts-steps { display: flex; flex-direction: column; gap: 3px; padding: 4px 0 2px; font-size: 12px; }
+.ts-thinking { color: #6b7f96; line-height: 1.4; padding: 1px 0; white-space: normal; font-style: italic; }
+.ts-tool-call { color: var(--muted); }
+.ts-tool-call code, .ts-tool-result code { background: var(--panel-2); padding: 1px 5px; border-radius: 4px; font-size: 11px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+.ts-tool-result { color: #4e6070; white-space: normal; }
+.ts-handoff { color: var(--auto); font-size: 11px; padding: 2px 0; }
+.ts-feed-post { color: #4e7060; white-space: normal; }
+
+/* Finding card — permanent, formatted, lands after each agent's thinking block */
+.live-step {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 14px;
+}
+.ls-actor { font-weight: 600; font-size: 13px; margin-bottom: 6px; }
+.ls-type { font-size: 10px; font-weight: 400; color: var(--muted); text-transform: uppercase; margin-left: 6px; letter-spacing: 0.04em; }
+.ls-action { margin-top: 6px; border-top: 1px solid var(--border); padding-top: 6px; }
 .ticket-badge { font-size: 13px; color: var(--accent); font-weight: 600; }
 
 /* Proposed Salesforce writes awaiting approval (human-in-the-loop) */

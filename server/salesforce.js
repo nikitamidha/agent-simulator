@@ -76,7 +76,7 @@ async function passwordOAuthLogin() {
 async function sfJson(args) {
   let stdout;
   try {
-    ({ stdout } = await execFileP("sf", args, { maxBuffer: 8 * 1024 * 1024 }));
+    ({ stdout } = await execFileP("sf", args, { maxBuffer: 8 * 1024 * 1024, env: { ...process.env, NO_COLOR: "1", FORCE_COLOR: "0" } }));
   } catch (e) {
     if (e.stdout) stdout = e.stdout; // `sf` prints JSON even on non-zero exit
     else if (e.code === "ENOENT")

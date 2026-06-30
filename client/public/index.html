@@ -33,13 +33,17 @@
             <span id="active-agent-mode" class="mode-tag"></span>
           </div>
           <div class="tab-bar">
-            <button class="tab active" data-tab="chat">Chat</button>
-            <button class="tab" data-tab="sf-logs">SF Update Logs</button>
+            <button class="tab active" data-tab="agent-run">Agent Run</button>
+            <button class="tab" data-tab="final-snapshot" id="snapshot-tab">Final Snapshot</button>
+            <button class="tab" data-tab="sfdc-logs">SFDC Update Logs</button>
           </div>
           <button id="reset-btn" class="ghost">Reset chat</button>
         </div>
 
         <div id="messages" class="messages"></div>
+        <div id="final-snapshot" class="final-snapshot hidden">
+          <div class="snapshot-empty">No run completed yet. Inject an event to see the final snapshot here.</div>
+        </div>
         <div id="sf-logs" class="sf-logs hidden">
           <div class="sf-logs-empty">No Salesforce writes yet. Inject an event to see account updates here.</div>
         </div>

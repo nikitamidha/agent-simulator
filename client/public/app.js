@@ -6,6 +6,24 @@
 const API = `http://${location.hostname}:4000`;
 const WS_URL = `ws://${location.hostname}:4000/ws`;
 
+// Override marked's table renderer so pipe-separated agent output flows as
+// normal text instead of being laid out as an HTML table.
+marked.use({
+  renderer: {
+    table(header, body) {
+      return `<div class="md-flat-table">${header}${body}</div>`;
+    },
+    tablerow(content) {
+      return `<p class="md-flat-row">${content}</p>`;
+    },
+    tablecell(content, flags) {
+      return flags && flags.header
+        ? `<strong>${content}</strong> `
+        : `${content} `;
+    },
+  },
+});
+
 // A per-browser-tab session id so each tab has its own conversation per agent.
 const sessionId =
   sessionStorage.getItem("sessionId") ||
@@ -30,6 +48,7 @@ const els = {
   activeName: document.getElementById("active-agent-name"),
   activeMode: document.getElementById("active-agent-mode"),
   messages: document.getElementById("messages"),
+  finalSnapshot: document.getElementById("final-snapshot"),
   sfLogs: document.getElementById("sf-logs"),
   chatForm: document.getElementById("chat-form"),
   chatInput: document.getElementById("chat-input"),
@@ -45,8 +64,9 @@ const els = {
 //  WebSocket — live thinking stream from the agent server
 // ---------------------------------------------------------------------------
 let ws = null;
-let activeThinkingNode = null; // the DOM node currently showing streaming steps
-let thinkingSteps = [];        // accumulated HTML strings for that node
+let activeThinkingNode = null;   // run-stream container node
+let currentThinkingAgent = null; // name of agent whose <details> is currently open
+let currentThinkingBlock = null; // the <details> DOM element for that agent
 
 function connectWebSocket() {
   ws = new WebSocket(`${WS_URL}?sessionId=${sessionId}`);
@@ -63,45 +83,126 @@ function connectWebSocket() {
   ws.onerror = () => {};
 }
 
+// Returns the .ts-steps div for the current agent's thinking <details>.
+// Creates a new labeled <details> when the agent changes.
+function agentThinkingSteps(agentName) {
+  if (!activeThinkingNode) return null;
+  const runBody = activeThinkingNode.querySelector(".run-body");
+  if (!runBody) return null;
+  if (currentThinkingAgent !== agentName || !currentThinkingBlock) {
+    currentThinkingAgent = agentName;
+    const details = document.createElement("details");
+    details.className = "thinking-block";
+    details.open = true;
+    details.innerHTML =
+      `<summary class="thinking-summary"><span class="ts-agent-name">${escapeHtml(agentName)}</span> thinking…</summary>` +
+      `<div class="ts-steps"></div>`;
+    runBody.appendChild(details);
+    currentThinkingBlock = details;
+  }
+  return currentThinkingBlock.querySelector(".ts-steps");
+}
+
 function handleStreamEvent(event) {
   if (event.type === "done") {
-    // Final reply is delivered via HTTP — the thinking node gets replaced there.
+    // Mark the run-stream as complete — leave it fully intact in Agent Run tab.
+    if (activeThinkingNode) {
+      // Close any thinking block still open when the run ends.
+      if (currentThinkingBlock) {
+        currentThinkingBlock.open = false;
+        const summary = currentThinkingBlock.querySelector(".thinking-summary");
+        if (summary) summary.dataset.done = "1";
+      }
+      const runBody = activeThinkingNode.querySelector(".run-body");
+      if (runBody) {
+        const marker = document.createElement("div");
+        marker.className = "run-complete-marker";
+        marker.textContent = "✓ Run complete";
+        runBody.appendChild(marker);
+      }
+      activeThinkingNode = null;
+      currentThinkingAgent = null;
+      currentThinkingBlock = null;
+    }
+
+    // Populate Final Snapshot tab with the full trace + closing summary.
+    const panel = document.getElementById("final-snapshot");
+    if (panel) {
+      let html = "";
+      if (event.reply) {
+        html += `<div class="snapshot-reply md-body">${marked.parse(event.reply)}</div>`;
+      }
+      if (event.trace && event.trace.length) {
+        html += traceHtml(event.trace);
+      }
+      panel.innerHTML = html || `<div class="snapshot-empty">Run completed with no output.</div>`;
+      // Badge the tab so the user knows it's ready, then switch to it.
+      const snapTab = document.getElementById("snapshot-tab");
+      if (snapTab) snapTab.classList.add("tab-badge");
+      switchTab("final-snapshot");
+    }
+
+    els.injectBtn.disabled = false;
     return;
   }
+
   if (event.type === "sf_write") {
     sfWriteLogs.push({ ...event, ts: new Date().toISOString() });
     renderSfLogs();
     return;
   }
-  if (!activeThinkingNode) return;
 
-  const stepsDiv = activeThinkingNode.querySelector(".thinking-steps");
+  if (!activeThinkingNode) return;
+  const runBody = activeThinkingNode.querySelector(".run-body");
+  if (!runBody) return;
+
+  // trace_step: a formatted finding card lands in the run-body, then the
+  // current thinking block collapses (that agent's step is done).
+  if (event.type === "trace_step") {
+    const card = document.createElement("div");
+    card.className = "live-step";
+    card.innerHTML =
+      `<div class="ls-actor">${escapeHtml(event.actor || "")} <span class="ls-type">AGENT</span></div>` +
+      `<div class="md-body">${marked.parse(event.finding || "")}</div>` +
+      (event.action ? `<div class="md-body ls-action">${marked.parse(event.action)}</div>` : "");
+    runBody.appendChild(card);
+    if (currentThinkingBlock) currentThinkingBlock.open = false;
+    currentThinkingBlock = null;
+    currentThinkingAgent = null;
+    els.messages.scrollTop = els.messages.scrollHeight;
+    return;
+  }
+
+  // All other events go into the agent's thinking <details>.
+  const stepsDiv = agentThinkingSteps(event.agent || event.from || "Agent");
   if (!stepsDiv) return;
 
   let html = "";
   switch (event.type) {
     case "thinking":
       if (event.text) {
-        html = `<div class="ts-thinking">💭 <strong>${escapeHtml(event.agent || "")}</strong>: ${escapeHtml(event.text.slice(0, 300))}${event.text.length > 300 ? "…" : ""}</div>`;
+        const t = event.text.slice(0, 300);
+        html = `<div class="ts-thinking">${escapeHtml(t)}${event.text.length > 300 ? "…" : ""}</div>`;
       }
       break;
     case "tool_call":
-      html = `<div class="ts-tool-call">🔧 <strong>${escapeHtml(event.agent || "")}</strong> → <code>${escapeHtml(event.name)}</code></div>`;
+      html = `<div class="ts-tool-call">🔧 <code>${escapeHtml(event.name)}</code></div>`;
       break;
     case "tool_result":
       html = `<div class="ts-tool-result">✓ <code>${escapeHtml(event.name)}</code>: ${escapeHtml(event.preview || "")}</div>`;
       break;
-    case "activate_agent":
-      html = `<div class="ts-activate">⚡ Activating <strong>${escapeHtml(event.specialist || "")}</strong></div>`;
+    case "handoff":
+      html = `<div class="ts-handoff">↪ handoff to <strong>${escapeHtml(event.to || "")}</strong></div>`;
       break;
-    case "feed_post":
-      html = `<div class="ts-feed-post">📝 <strong>${escapeHtml(event.agent || "")}</strong> → Salesforce Case feed (${escapeHtml(event.caseId || "")}): <em>${escapeHtml(event.body || "")}</em></div>`;
+    case "feed_post": {
+      const snippet = (event.body || "").slice(0, 140) + ((event.body || "").length > 140 ? "…" : "");
+      html = `<div class="ts-feed-post">📝 Salesforce feed: ${escapeHtml(snippet)}</div>`;
       break;
+    }
   }
 
   if (html) {
-    thinkingSteps.push(html);
-    stepsDiv.innerHTML = thinkingSteps.join("");
+    stepsDiv.insertAdjacentHTML("beforeend", html);
     els.messages.scrollTop = els.messages.scrollHeight;
   }
 }
@@ -135,13 +236,20 @@ els.resetOrgBtn.addEventListener("click", async () => {
 });
 
 // --- Tab switching ---
+function switchTab(tabId) {
+  activeTab = tabId;
+  document.querySelectorAll(".tab").forEach((t) => t.classList.toggle("active", t.dataset.tab === tabId));
+  els.messages.classList.toggle("hidden", tabId !== "agent-run");
+  document.getElementById("final-snapshot").classList.toggle("hidden", tabId !== "final-snapshot");
+  els.sfLogs.classList.toggle("hidden", tabId !== "sfdc-logs");
+}
+
 document.querySelector(".tab-bar").addEventListener("click", (e) => {
   const btn = e.target.closest(".tab");
   if (!btn) return;
-  activeTab = btn.dataset.tab;
-  document.querySelectorAll(".tab").forEach((t) => t.classList.toggle("active", t.dataset.tab === activeTab));
-  els.messages.classList.toggle("hidden", activeTab !== "chat");
-  els.sfLogs.classList.toggle("hidden", activeTab !== "sf-logs");
+  // Clear the new-run badge when user clicks Final Snapshot
+  if (btn.dataset.tab === "final-snapshot") btn.classList.remove("tab-badge");
+  switchTab(btn.dataset.tab);
 });
 
 // --- Init ---
@@ -261,8 +369,8 @@ function traceHtml(trace) {
       (r) =>
         `<li><span class="t-step">${r.step}</span><div class="t-body">` +
         `<div class="t-actor">${escapeHtml(r.actor || "")} <span class="t-type">${escapeHtml(r.actorType || "Agent")}</span></div>` +
-        `<div class="t-find">🔎 ${escapeHtml(r.finding || "")}</div>` +
-        `<div class="t-act">⚙️ ${escapeHtml(r.action || "")}</div></div></li>`,
+        `<div class="t-find md-body">${marked.parse(r.finding || "")}</div>` +
+        `<div class="t-act md-body">${marked.parse(r.action || "")}</div></div></li>`,
     )
     .join("");
   return `<div class="msg trace"><div class="trace-label">🧭 Run trace (local · ${trace.length} steps)</div><ol class="trace-list">${items}</ol></div>`;
@@ -440,25 +548,28 @@ els.injectBtn.addEventListener("click", async () => {
     return;
   }
 
-  // Step 2 — run the Orchestrator on the ticket.
-  // Thinking steps stream in live via WebSocket; final reply arrives via HTTP.
-  const pending = thinking();
+  // Step 2 — kick off the Orchestrator run. The server returns 202 immediately;
+  // thinking steps and the final result arrive via WebSocket (handleStreamEvent).
+  // injectBtn stays disabled until the "done" WS event re-enables it.
+  thinking();
   try {
     const res = await fetch(`${API}/api/run`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ sessionId, caseId: ticket.caseId }),
     });
-    const data = await res.json();
-    pending.remove();
-    activeThinkingNode = null;
-    push("agent", data.reply ?? `Error: ${data.error}`, data.sources, data.proposedActions);
-    pushTrace(data.trace);
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      activeThinkingNode?.remove();
+      activeThinkingNode = null;
+      push("agent", `Agent run failed: ${data.error || res.statusText}`);
+      els.injectBtn.disabled = false;
+    }
+    // Success (202) — wait for "done" over WebSocket.
   } catch (err) {
-    pending.remove();
+    activeThinkingNode?.remove();
     activeThinkingNode = null;
     push("agent", `Agent run failed: ${err.message}`);
-  } finally {
     els.injectBtn.disabled = false;
   }
 });
@@ -477,12 +588,14 @@ els.resetBtn.addEventListener("click", async () => {
 
 // --- Helpers ---
 function thinking() {
-  thinkingSteps = [];
+  currentThinkingAgent = null;
+  currentThinkingBlock = null;
+  // Remove the "no messages yet" placeholder if it's still showing.
+  const empty = els.messages.querySelector(".empty");
+  if (empty) empty.remove();
   const node = document.createElement("div");
-  node.className = "msg agent thinking-stream";
-  node.innerHTML =
-    `<div class="role">${escapeHtml(activeAgent?.name ?? "Agent")}</div>` +
-    `<div class="thinking-steps"><em class="thinking-pulse">Working…</em></div>`;
+  node.className = "msg agent run-stream";
+  node.innerHTML = `<div class="run-body"></div>`;
   els.messages.appendChild(node);
   els.messages.scrollTop = els.messages.scrollHeight;
   activeThinkingNode = node;
