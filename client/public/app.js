@@ -38,6 +38,7 @@ let activeAgent = null;
 const transcripts = {}; // agentId -> array of {role, text}
 const sfWriteLogs = []; // all SF create/update events across all runs
 let activeTab = "chat";
+let pendingHumanInput = null;  // { id } when agent is blocked waiting for chat input
 
 // --- DOM refs ---
 const els = {
@@ -107,7 +108,6 @@ function handleStreamEvent(event) {
   if (event.type === "done") {
     // Mark the run-stream as complete — leave it fully intact in Agent Run tab.
     if (activeThinkingNode) {
-      // Close any thinking block still open when the run ends.
       if (currentThinkingBlock) {
         currentThinkingBlock.open = false;
         const summary = currentThinkingBlock.querySelector(".thinking-summary");
@@ -149,6 +149,21 @@ function handleStreamEvent(event) {
   if (event.type === "sf_write") {
     sfWriteLogs.push({ ...event, ts: new Date().toISOString() });
     renderSfLogs();
+    return;
+  }
+
+  // Human input events are handled regardless of whether a thinking stream is active.
+  if (event.type === "human_input_requested") {
+    pendingHumanInput = { id: event.id };
+    if (activeAgent) push("agent", event.message || "");
+    setHumanInputBanner(true);
+    const stepsDiv = agentThinkingSteps(event.agent || "Agent");
+    if (stepsDiv) stepsDiv.insertAdjacentHTML("beforeend", `<div class="ts-human-input">🙋 Waiting for operator input</div>`);
+    return;
+  }
+  if (event.type === "human_input_answered") {
+    pendingHumanInput = null;
+    setHumanInputBanner(false);
     return;
   }
 
@@ -206,6 +221,23 @@ function handleStreamEvent(event) {
     stepsDiv.insertAdjacentHTML("beforeend", html);
     els.messages.scrollTop = els.messages.scrollHeight;
   }
+}
+
+function setHumanInputBanner(show) {
+  let banner = document.getElementById("human-input-banner");
+  if (!show) {
+    if (banner) banner.remove();
+    els.chatInput.placeholder = "Type a message…";
+    return;
+  }
+  if (!banner) {
+    banner = document.createElement("div");
+    banner.id = "human-input-banner";
+    els.chatForm.parentNode.insertBefore(banner, els.chatForm);
+  }
+  banner.innerHTML = `<span class="hib-label">Agent is waiting for your reply — type below and press Send</span>`;
+  els.chatInput.placeholder = "Type your reply…";
+  els.chatInput.focus();
 }
 
 // --- Reset Org to Demo Data ---
@@ -333,21 +365,27 @@ function selectAgent(agent) {
 }
 
 function renderMessages() {
+  // Preserve the live thinking stream — detach it before replacing innerHTML,
+  // then re-attach it so push() calls during an active run don't destroy it.
+  if (activeThinkingNode) activeThinkingNode.remove();
+
   const list = activeAgent ? transcripts[activeAgent.id] : [];
   if (!list || list.length === 0) {
     els.messages.innerHTML = `<div class="empty">No messages yet. Say hello or inject an event.</div>`;
-    return;
+  } else {
+    els.messages.innerHTML = list
+      .map((m) => {
+        if (m.role === "trace") return traceHtml(m.trace);
+        const label = m.role === "user" ? "You" : activeAgent.name;
+        const body = m.role === "agent"
+          ? `<div class="md-body">${marked.parse(m.text ?? "")}</div>`
+          : escapeHtml(m.text);
+        return `<div class="msg ${m.role}"><div class="role">${escapeHtml(label)}</div>${body}${sourcesHtml(m.sources)}${actionsHtml(m.actions)}</div>`;
+      })
+      .join("");
   }
-  els.messages.innerHTML = list
-    .map((m) => {
-      if (m.role === "trace") return traceHtml(m.trace);
-      const label = m.role === "user" ? "You" : activeAgent.name;
-      const body = m.role === "agent"
-        ? `<div class="md-body">${marked.parse(m.text ?? "")}</div>`
-        : escapeHtml(m.text);
-      return `<div class="msg ${m.role}"><div class="role">${escapeHtml(label)}</div>${body}${sourcesHtml(m.sources)}${actionsHtml(m.actions)}</div>`;
-    })
-    .join("");
+
+  if (activeThinkingNode) els.messages.appendChild(activeThinkingNode);
   els.messages.scrollTop = els.messages.scrollHeight;
 }
 
@@ -483,6 +521,25 @@ els.chatForm.addEventListener("submit", async (e) => {
   if (!text || !activeAgent) return;
   els.chatInput.value = "";
   push("user", text);
+
+  // If the agent is blocked waiting for human input, deliver the answer directly.
+  if (pendingHumanInput) {
+    const { id } = pendingHumanInput;
+    pendingHumanInput = null;
+    setHumanInputBanner(null);
+    try {
+      await fetch(`${API}/api/human-input`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ id, answer: text }),
+      });
+      // Agent loop resumes on the server — "done" WS event will arrive when it finishes.
+    } catch (err) {
+      push("agent", `Failed to deliver answer: ${err.message}`);
+    }
+    return;
+  }
+
   const pending = thinking();
   try {
     const res = await fetch(`${API}/api/chat`, {

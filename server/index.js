@@ -66,8 +66,11 @@ function historyFor(agentId, sessionId) {
   return conversations.get(key);
 }
 
-// Pending HITL write proposals.
+// Pending HITL write proposals (SF create/update approvals).
 const pendingActions = new Map(); // id -> { id, agentId, sessionId, caseId, accountId, op, input, status }
+
+// Pending human-input gates — tool blocks on a Promise until the user responds.
+const pendingHumanInputs = new Map(); // id -> { resolve, sessionId, caseId }
 
 // ---------------------------------------------------------------------------
 //  WebSocket server (no external deps — raw Node TCP upgrade)
@@ -205,7 +208,7 @@ const HANDOFF_TO_AGENT_TOOL = {
 const REQUEST_HUMAN_INPUT_TOOL = {
   name: "request_human_input",
   description:
-    "Record this agent's findings and actions to the ticket trace, then pause and ask a human operator a question before proceeding. Use when you lack information needed to act safely. This is the only way to log a trace step and gate — do not call log_trace_step separately. Once called, stop and do not proceed until the answer arrives.",
+    "Record this agent's findings and actions to the ticket trace, then pause and show the operator a message in the chat UI before proceeding. Use when you need a human decision to act safely. The message is displayed as a normal chat response — the operator types their reply directly in the chat input box. Once called, the agent loop is suspended until the operator responds.",
   input_schema: {
     type: "object",
     properties: {
@@ -220,13 +223,9 @@ const REQUEST_HUMAN_INPUT_TOOL = {
         },
         required: ["finding", "action", "handoff"],
       },
-      question: {
+      message: {
         type: "string",
-        description: "The specific question for the human operator. Be concise and unambiguous — one question per call.",
-      },
-      context: {
-        type: "string",
-        description: "Optional: a sentence of context explaining why you need this information and what you will do once you have it.",
+        description: "Markdown-formatted message shown to the operator in the chat UI. Write it as a natural agent message: brief summary of what you know and what you've done, then what you need. Maximum 4 sentences. End with exactly one clear, specific question on its own line. Do not include bullet lists or headers — plain prose only.",
       },
       urgency: {
         type: "string",
@@ -234,7 +233,7 @@ const REQUEST_HUMAN_INPUT_TOOL = {
         enum: ["High", "Medium", "Low"],
       },
     },
-    required: ["log_trace", "question"],
+    required: ["log_trace", "message"],
   },
 };
 
@@ -484,17 +483,24 @@ function makeExecutor(agent, ctx, proposed, onStep, initialTask) {
       if (onStep) onStep({ type: "handoff", from: agent.name, to: target.name, caseId: ctx.caseId, task: input.task });
 
       // Build enriched task: original context + all gathered data + handoff instruction.
-      const parts = [`[Handed off from: ${agent.name}]`];
-      if (initialTask) parts.push(`Original task:\n${initialTask}`);
+      const parts = [
+        `━━━ HANDOFF FROM: ${agent.name.toUpperCase()} ━━━`,
+        `The following data was already fetched by ${agent.name}. DO NOT re-query these — use the results below directly.`,
+      ];
+      if (initialTask) parts.push(`ORIGINAL TASK GIVEN TO ${agent.name.toUpperCase()}:\n${initialTask}`);
       if (queryLog.length) {
-        parts.push("Salesforce data gathered by prior agent:");
-        queryLog.forEach(({ soql, result }) => parts.push(`Query: ${soql}\nResult: ${result}`));
+        parts.push(`SALESFORCE QUERIES ALREADY EXECUTED (${queryLog.length}):`);
+        queryLog.forEach(({ soql, result }, i) =>
+          parts.push(`[SF Query ${i + 1}]\nSOQL: ${soql}\nResult:\n${result}`)
+        );
       }
       if (knowledgeLog.length) {
-        parts.push("Knowledge base lookups by prior agent:");
-        knowledgeLog.forEach(({ query, text }) => parts.push(`Query: ${query}\n${text}`));
+        parts.push(`KNOWLEDGE BASE LOOKUPS ALREADY EXECUTED (${knowledgeLog.length}):`);
+        knowledgeLog.forEach(({ query, text }, i) =>
+          parts.push(`[KB Lookup ${i + 1}]\nQuery: "${query}"\nResult:\n${text}`)
+        );
       }
-      parts.push(`Handoff instruction:\n${input.task}`);
+      parts.push(`YOUR TASK (from ${agent.name}):\n${input.task}`);
       const enrichedTask = parts.join("\n\n");
 
       // Agent replacement: throw instead of returning — caller's loop terminates.
@@ -502,7 +508,7 @@ function makeExecutor(agent, ctx, proposed, onStep, initialTask) {
     }
 
     if (name === "request_human_input") {
-      // Record the trace step embedded in this call before raising the gate.
+      // Record the trace step before blocking.
       if (ctx.caseId) {
         const lt = input.log_trace || {};
         const { step } = await recordTrace(ctx.caseId, { actor: agent.name, finding: lt.finding, action: lt.action, handoff: lt.handoff, debug: lt.debug, milestone: true });
@@ -514,29 +520,14 @@ function makeExecutor(agent, ctx, proposed, onStep, initialTask) {
           sf.postToFeed(ctx.caseId, feedBody).catch((err) => console.error("[FEED POST FAILED] Case", ctx.caseId, "—", err.message));
         }
       }
+      // Block the tool loop — resume only when the user submits via the chat input.
       const id = "input_" + Math.random().toString(36).slice(2, 9);
-      const gate = {
-        id,
-        type: "human_input",
-        op: "request_human_input",
-        agentId: agent.id,
-        agentName: agent.name,
-        sessionId: ctx.sessionId,
-        caseId: ctx.caseId,
-        accountId: ctx.accountId,
-        question: input.question,
-        context: input.context || null,
-        urgency: input.urgency || "Medium",
-        status: "pending",
-        askedAt: new Date().toISOString(),
-        _resumeAgent: agent,
-        _resumeCtx: ctx,
-        _resumeProposed: proposed,
-      };
-      pendingActions.set(id, gate);
-      proposed.push({ id, agentId: agent.id, agentName: agent.name, op: "request_human_input", question: input.question, context: input.context, urgency: input.urgency || "Medium" });
-      if (onStep) onStep({ type: "human_input_requested", agent: agent.name, caseId: ctx.caseId, question: input.question, urgency: gate.urgency, id });
-      return `HUMAN INPUT REQUESTED (id=${id}): "${input.question}". Stop and wait — do not proceed until the operator responds.`;
+      if (onStep) onStep({ type: "human_input_requested", agent: agent.name, caseId: ctx.caseId, message: input.message, urgency: input.urgency || "Medium", id });
+      const answer = await new Promise((resolve) => {
+        pendingHumanInputs.set(id, { resolve, sessionId: ctx.sessionId, caseId: ctx.caseId });
+      });
+      if (onStep) onStep({ type: "human_input_answered", id, answer });
+      return answer;
     }
 
     return `Unknown tool: ${name}`;
@@ -873,33 +864,6 @@ const server = http.createServer(async (req, res) => {
         }
       }
 
-      // ── Human input gate (Inputs Required / Verify & Close) ──────────────
-      else if (action.op === "request_human_input") {
-        const humanAnswer = answer || (decision === "approved" ? "Confirmed." : note || "Request declined.");
-        if (action.caseId)
-          await recordTrace(action.caseId, {
-            actor: "Human",
-            actorType: "Human",
-            finding: `Human responded to agent question: "${action.question}"`,
-            action: humanAnswer,
-            gate_type: "Inputs Required",
-            decision: decision === "approved" ? "Approved" : "Rejected",
-            outcome: "Pending",
-            milestone: true,
-          });
-        // Resume the originating agent with the answer injected as context.
-        out = await runAgentTask(
-          action._resumeAgent || agent,
-          action._resumeCtx || ctx,
-          `The human operator has responded to your question.\n` +
-            `Question: "${action.question}"\n` +
-            `Answer: ${humanAnswer}\n\n` +
-            `Resume from where you left off using this answer. ` +
-            `If this was a Verify & Close confirmation, proceed to set the Case stage to Resolved and then hand off to the Communications Agent for closure.`,
-          onStep,
-        );
-      }
-
       else {
         return sendJSON(res, 400, { error: `Unhandled gate op: ${action.op}` });
       }
@@ -907,6 +871,30 @@ const server = http.createServer(async (req, res) => {
       if (action.caseId) await writeInternalComments(action.caseId);
       wsEmit(action.sessionId, { type: "done" });
       return sendJSON(res, 200, { ok: true, trace: runTraces.get(action.caseId) || [], ...out });
+    }
+
+    // Deliver a human answer to a blocked request_human_input tool call.
+    // The agent loop is still in-flight — this resolves the Promise and lets it continue.
+    if (req.method === "POST" && url.pathname === "/api/human-input") {
+      const { id, answer } = await readBody(req);
+      if (!id || !answer) return sendJSON(res, 400, { error: "id and answer required" });
+      const pending = pendingHumanInputs.get(id);
+      if (!pending) return sendJSON(res, 404, { error: "Unknown or already resolved input id" });
+      pendingHumanInputs.delete(id);
+      if (pending.caseId) {
+        await recordTrace(pending.caseId, {
+          actor: "Human",
+          actorType: "Human",
+          finding: `Human responded via chat input.`,
+          action: answer,
+          gate_type: "Inputs Required",
+          decision: "Approved",
+          outcome: "Pending",
+          milestone: true,
+        });
+      }
+      pending.resolve(answer);
+      return sendJSON(res, 200, { ok: true });
     }
 
     if (req.method === "POST" && url.pathname === "/api/reset") {
