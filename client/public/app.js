@@ -164,7 +164,8 @@ function handleStreamEvent(event) {
     card.innerHTML =
       `<div class="ls-actor">${escapeHtml(event.actor || "")} <span class="ls-type">AGENT</span></div>` +
       `<div class="md-body">${marked.parse(event.finding || "")}</div>` +
-      (event.action ? `<div class="md-body ls-action">${marked.parse(event.action)}</div>` : "");
+      (event.action ? `<div class="md-body ls-section">${marked.parse(event.action)}</div>` : "") +
+      (event.handoff ? `<div class="md-body ls-section">${marked.parse(event.handoff)}</div>` : "");
     runBody.appendChild(card);
     if (currentThinkingBlock) currentThinkingBlock.open = false;
     currentThinkingBlock = null;
@@ -370,7 +371,9 @@ function traceHtml(trace) {
         `<li><span class="t-step">${r.step}</span><div class="t-body">` +
         `<div class="t-actor">${escapeHtml(r.actor || "")} <span class="t-type">${escapeHtml(r.actorType || "Agent")}</span></div>` +
         `<div class="t-find md-body">${marked.parse(r.finding || "")}</div>` +
-        `<div class="t-act md-body">${marked.parse(r.action || "")}</div></div></li>`,
+        (r.action ? `<div class="t-act md-body">${marked.parse(r.action)}</div>` : "") +
+        (r.handoff ? `<div class="t-act md-body">${marked.parse(r.handoff)}</div>` : "") +
+        `</div></li>`,
     )
     .join("");
   return `<div class="msg trace"><div class="trace-label">🧭 Run trace (local · ${trace.length} steps)</div><ol class="trace-list">${items}</ol></div>`;

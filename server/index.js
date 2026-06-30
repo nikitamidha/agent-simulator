@@ -156,26 +156,6 @@ const SF_UPDATE_TOOL = {
     required: ["sobject", "recordId", "fields"],
   },
 };
-const LOG_TRACE_TOOL = {
-  name: "log_trace_step",
-  description:
-    "Append a step to the active ticket's agent trace (Agent_Action_Log__c on the Case) so it shows on the ticket. Call this after each meaningful observation→action. Keep finding and action to one sentence each.",
-  input_schema: {
-    type: "object",
-    properties: {
-      finding: { type: "string", description: "Human-readable summary of what you observed. Written for the UI — plain English, no raw IDs or field names." },
-      action: { type: "string", description: "Human-readable summary of what you did. Written for the UI — plain English, no raw IDs or field names." },
-      debug: { type: "string", description: "Optional. Raw technical detail for the audit log only — SF object IDs, exact field values, tool inputs/outputs, query results. Never shown in the UI." },
-      stage: { type: "string", description: "Optional Case stage: Detected/Triaged/Diagnosing/Resolving/Gated/Resolved/Closed." },
-      confidence: { type: "number", description: "Optional 0–100." },
-      gate_type: { type: "string", description: "Optional: Approval/On-site/Verify & Close/Inputs Required/None." },
-      decision: { type: "string", description: "Optional: Approved/Rejected/N/A." },
-      outcome: { type: "string", description: "Optional: Success/Failed/Partial/Pending." },
-      milestone: { type: "boolean", description: "Set true for key moments (hand-off, gate, resolution, closure). Milestones are the steps persisted to Salesforce when trace-to-Salesforce is in milestone mode." },
-    },
-    required: ["finding", "action"],
-  },
-};
 const RETRIEVE_KNOWLEDGE_TOOL = {
   name: "retrieve_knowledge",
   description:
@@ -193,10 +173,21 @@ const RETRIEVE_KNOWLEDGE_TOOL = {
 const HANDOFF_TO_AGENT_TOOL = {
   name: "handoff_to_agent",
   description:
-    "Delegate a specific task to another specialist agent and receive its response. Use when you have completed your phase and a different agent should handle the next step — e.g. Diagnostic hands off to Intake after detecting an anomaly, or Intake hands off to Resolution after triaging. The target agent runs in full and its reply is returned to you. Log a trace step before calling this to record the hand-off.",
+    "Record this agent's findings and actions to the ticket trace, then delegate the next task to a specialist agent. This is the only way to log a trace step and hand off — do not call log_trace_step separately. The target agent runs in full and its reply is returned.",
   input_schema: {
     type: "object",
     properties: {
+      log_trace: {
+        type: "object",
+        description: "Trace entry written to the ticket and shown in the simulator UI.",
+        properties: {
+          finding: { type: "string", description: "What you observed. Plain English, no raw IDs or field names." },
+          action: { type: "string", description: "What you did. Plain English, no raw IDs or field names." },
+          handoff: { type: "string", description: "Which agent you are handing off to and why, in one sentence." },
+          debug: { type: "string", description: "Optional. Raw technical detail for the audit log only — SF IDs, field values, query results. Never shown in the UI." },
+        },
+        required: ["finding", "action", "handoff"],
+      },
       agentId: {
         type: "string",
         description: "Id of the agent to activate. One of: diagnostic-agent | intake-agent | resolution-agent | communications-agent.",
@@ -207,17 +198,28 @@ const HANDOFF_TO_AGENT_TOOL = {
         description: "A concise plain-English brief for the target agent. Include the Case Id, the asset, and the specific action you need it to take.",
       },
     },
-    required: ["agentId", "task"],
+    required: ["log_trace", "agentId", "task"],
   },
 };
 
 const REQUEST_HUMAN_INPUT_TOOL = {
   name: "request_human_input",
   description:
-    "Pause the agent and ask a human operator a specific question before proceeding. Use when you lack information needed to act safely — e.g. which asset is affected, whether a risky runbook step is authorised, or if the situation is outside your confidence threshold. The question will be surfaced to the operator in the UI. Once called, stop and do not proceed until the answer arrives.",
+    "Record this agent's findings and actions to the ticket trace, then pause and ask a human operator a question before proceeding. Use when you lack information needed to act safely. This is the only way to log a trace step and gate — do not call log_trace_step separately. Once called, stop and do not proceed until the answer arrives.",
   input_schema: {
     type: "object",
     properties: {
+      log_trace: {
+        type: "object",
+        description: "Trace entry written to the ticket and shown in the simulator UI.",
+        properties: {
+          finding: { type: "string", description: "What you observed. Plain English, no raw IDs or field names." },
+          action: { type: "string", description: "What you did or decided before reaching this gate. Plain English, no raw IDs or field names." },
+          handoff: { type: "string", description: "One sentence describing what gate you are raising and why human input is needed." },
+          debug: { type: "string", description: "Optional. Raw technical detail for the audit log only — SF IDs, field values, query results. Never shown in the UI." },
+        },
+        required: ["finding", "action", "handoff"],
+      },
       question: {
         type: "string",
         description: "The specific question for the human operator. Be concise and unambiguous — one question per call.",
@@ -232,14 +234,13 @@ const REQUEST_HUMAN_INPUT_TOOL = {
         enum: ["High", "Medium", "Low"],
       },
     },
-    required: ["question"],
+    required: ["log_trace", "question"],
   },
 };
 
 function buildTools(_agent) {
   return [
     SF_QUERY_TOOL,
-    LOG_TRACE_TOOL,
     SF_CREATE_TOOL,
     SF_UPDATE_TOOL,
     RETRIEVE_KNOWLEDGE_TOOL,
@@ -332,7 +333,7 @@ function dataAccessContext(agent, ctx) {
     return `CUSTOMER DATABASE (mock — Salesforce not configured):\n${rows}`;
   }
   const parts = [
-    "SALESFORCE ORG ACCESS: live tools — salesforce_query, salesforce_create, salesforce_update, log_trace_step, retrieve_knowledge, handoff_to_agent, request_human_input. Read real records before acting; never invent data.",
+    "SALESFORCE ORG ACCESS: live tools — salesforce_query, salesforce_create, salesforce_update, retrieve_knowledge, handoff_to_agent, request_human_input. Read real records before acting; never invent data.",
     "KEY OBJECTS & FIELDS:\n" + SCHEMA_SUMMARY,
     "ALLOWED PICKLIST VALUES (use these EXACTLY — do not invent values):\n" + PICKLISTS,
   ];
@@ -341,7 +342,7 @@ function dataAccessContext(agent, ctx) {
       `ACTIVE TICKET: Case Id ${ctx.caseId}` +
         (ctx.caseNumber ? ` (CaseNumber ${ctx.caseNumber})` : "") +
         (ctx.account ? ` for account "${ctx.account}"` : "") +
-        `. Log every observation→action to THIS ticket with log_trace_step, and scope queries to it.`,
+        `. Scope all queries to this ticket. Log your findings and actions via handoff_to_agent or request_human_input — these are the only trace-writing tools.`,
     );
   }
   if (ctx && ctx.assets && ctx.assets.length) {
@@ -350,17 +351,17 @@ function dataAccessContext(agent, ctx) {
         ctx.assets
           .map((a) => `  - ${a.Name} [${a.Id}] ${a.Service_Line__c || ""} ${a.Asset_Type__c || ""}${a.Site__c ? " @ " + a.Site__c : ""}`)
           .join("\n") +
-        '\nIf the event does not match any of these assets, do not fabricate one — log a trace step (finding = the mismatch; action = "Inputs Required: confirm the correct account/asset") and stop.',
+        '\nIf the event does not match any of these assets, do not fabricate one — call request_human_input (finding = the mismatch; action = "Inputs Required: confirm the correct account/asset") and stop.',
     );
   } else if (ctx && ctx.caseId) {
     parts.push(
-      'This account has no assets on record. If the incident needs an asset, log a trace step (action = "Inputs Required") and stop rather than inventing one.',
+      'This account has no assets on record. If the incident needs an asset, call request_human_input (action = "Inputs Required") and stop rather than inventing one.',
     );
   }
   parts.push(
     agent.mode === "hitl"
-      ? "WRITE GATING: human-in-the-loop. salesforce_query and log_trace_step run freely; salesforce_create/salesforce_update are captured as proposals needing operator approval — propose, then summarize and stop."
-      : "WRITE GATING: autonomous. salesforce_create/salesforce_update execute immediately; keep actions reversible and in-scope, and log each via log_trace_step.",
+      ? "WRITE GATING: human-in-the-loop. salesforce_query runs freely; salesforce_create/salesforce_update are captured as proposals needing operator approval — propose, then summarize and stop."
+      : "WRITE GATING: autonomous. salesforce_create/salesforce_update execute immediately; keep actions reversible and in-scope.",
   );
   return parts.join("\n\n");
 }
@@ -377,7 +378,7 @@ function buildSystem(agent, ctx) {
     "END STATE: a ticket is done at Case.Stage__c='Resolved' (after a verified fix) and then 'Closed' (after closure comms). A specialist sets Case.Stage__c when it completes its part; the Orchestrator drives the ticket to this end state and then stops. Once a ticket is Resolved or Closed, autonomous agents do not run on it.",
     "Use retrieve_knowledge to look up runbooks, SLA rules, and escalation criteria before acting. Do not invent procedures.",
     "Keep responses concise and operational.",
-    `TRACE WRITING STYLE — applies to every log_trace_step call:
+    `TRACE WRITING STYLE — applies to every handoff_to_agent and request_human_input call:
 Write every trace entry in Markdown. Use the section headers below. Be succinct — key takeaways only, no repetition, no raw field names.
 
 ## Findings
@@ -425,26 +426,6 @@ function makeExecutor(agent, ctx, proposed, onStep) {
       return JSON.stringify({ totalSize: r.totalSize, records: stripAttributes(r.records) }).slice(0, 8000);
     }
 
-    if (name === "log_trace_step") {
-      if (!ctx.caseId) return "No active ticket — cannot log a trace step.";
-      const { step } = await recordTrace(ctx.caseId, { actor: agent.name, finding: input.finding, action: input.action, debug: input.debug, stage: input.stage, confidence: input.confidence, gate_type: input.gate_type, decision: input.decision, outcome: input.outcome, milestone: input.milestone });
-      if (onStep) onStep({ type: "trace_step", step, actor: agent.name, actorType: "Agent", finding: input.finding, action: input.action, stage: input.stage, milestone: input.milestone, confidence: input.confidence, outcome: input.outcome });
-      if (SF_ON) {
-        // Strip markdown syntax (headers, bold, bullets) before posting to Salesforce feed.
-        const stripMd = (s = "") => s
-          .replace(/^#{1,6}\s+/gm, "")   // ## headers
-          .replace(/\*\*(.+?)\*\*/g, "$1") // **bold**
-          .replace(/\*(.+?)\*/g, "$1")     // *italic*
-          .replace(/^[-*]\s+/gm, "• ")    // bullet points
-          .replace(/\[tool:[^\]]+\]/g, "") // [tool: xyz] annotations
-          .trim();
-        const feedBody = `[${agent.name}]\nFinding: ${stripMd(input.finding)}\nAction: ${stripMd(input.action)}`;
-        if (onStep) onStep({ type: "feed_post", agent: agent.name, caseId: ctx.caseId, body: feedBody });
-        sf.postToFeed(ctx.caseId, feedBody).catch((err) => console.error("[FEED POST FAILED] Case", ctx.caseId, "—", err.message));
-      }
-      return `Logged trace step ${step}.`;
-    }
-
     const isWrite = name === "salesforce_create" || name === "salesforce_update";
     if (isWrite && agent.mode === "hitl") {
       const id = "act_" + Math.random().toString(36).slice(2, 9);
@@ -472,12 +453,36 @@ function makeExecutor(agent, ctx, proposed, onStep) {
     if (name === "handoff_to_agent") {
       const target = getAgent(input.agentId);
       if (!target) return `Unknown agent id: ${input.agentId}. Valid ids: diagnostic-agent, intake-agent, resolution-agent, communications-agent.`;
+      // Record the trace step embedded in this call before executing the handoff.
+      if (ctx.caseId) {
+        const lt = input.log_trace || {};
+        const { step } = await recordTrace(ctx.caseId, { actor: agent.name, finding: lt.finding, action: lt.action, handoff: lt.handoff, debug: lt.debug, milestone: true });
+        if (onStep) onStep({ type: "trace_step", step, actor: agent.name, actorType: "Agent", finding: lt.finding, action: lt.action, handoff: lt.handoff });
+        if (SF_ON) {
+          const stripMd = (s = "") => s.replace(/^#{1,6}\s+/gm, "").replace(/\*\*(.+?)\*\*/g, "$1").replace(/\*(.+?)\*/g, "$1").replace(/^[-*]\s+/gm, "• ").replace(/\[tool:[^\]]+\]/g, "").trim();
+          const feedBody = `[${agent.name}]\nFinding: ${stripMd(lt.finding)}\nAction: ${stripMd(lt.action)}`;
+          if (onStep) onStep({ type: "feed_post", agent: agent.name, caseId: ctx.caseId, body: feedBody });
+          sf.postToFeed(ctx.caseId, feedBody).catch((err) => console.error("[FEED POST FAILED] Case", ctx.caseId, "—", err.message));
+        }
+      }
       if (onStep) onStep({ type: "handoff", from: agent.name, to: target.name, caseId: ctx.caseId, task: input.task });
       const { reply } = await runAgentTask(target, ctx, input.task, onStep);
       return `[${target.name} response]\n${reply}`;
     }
 
     if (name === "request_human_input") {
+      // Record the trace step embedded in this call before raising the gate.
+      if (ctx.caseId) {
+        const lt = input.log_trace || {};
+        const { step } = await recordTrace(ctx.caseId, { actor: agent.name, finding: lt.finding, action: lt.action, handoff: lt.handoff, debug: lt.debug, milestone: true });
+        if (onStep) onStep({ type: "trace_step", step, actor: agent.name, actorType: "Agent", finding: lt.finding, action: lt.action, handoff: lt.handoff });
+        if (SF_ON) {
+          const stripMd = (s = "") => s.replace(/^#{1,6}\s+/gm, "").replace(/\*\*(.+?)\*\*/g, "$1").replace(/\*(.+?)\*/g, "$1").replace(/^[-*]\s+/gm, "• ").replace(/\[tool:[^\]]+\]/g, "").trim();
+          const feedBody = `[${agent.name}]\nFinding: ${stripMd(lt.finding)}\nAction: ${stripMd(lt.action)}`;
+          if (onStep) onStep({ type: "feed_post", agent: agent.name, caseId: ctx.caseId, body: feedBody });
+          sf.postToFeed(ctx.caseId, feedBody).catch((err) => console.error("[FEED POST FAILED] Case", ctx.caseId, "—", err.message));
+        }
+      }
       const id = "input_" + Math.random().toString(36).slice(2, 9);
       const gate = {
         id,
@@ -493,7 +498,6 @@ function makeExecutor(agent, ctx, proposed, onStep) {
         urgency: input.urgency || "Medium",
         status: "pending",
         askedAt: new Date().toISOString(),
-        // thread snapshot so the agent can resume mid-run when the answer arrives
         _resumeAgent: agent,
         _resumeCtx: ctx,
         _resumeProposed: proposed,
@@ -544,6 +548,68 @@ async function loadCaseCtx(caseId, sessionId) {
     } catch {}
   }
   return { sessionId, caseId, caseNumber: row.CaseNumber, account: row.Account && row.Account.Name, accountId: row.AccountId, assets };
+}
+
+// Build a plain-text Internal_Comments__c snapshot from live Case state + trace,
+// then write it. Called by the harness after every agent run and HITL response.
+async function writeInternalComments(caseId) {
+  if (!SF_ON) { console.log("[INTERNAL COMMENTS] SF not configured — skipping."); return; }
+  console.log("[INTERNAL COMMENTS] Writing snapshot for case", caseId);
+  try {
+    const res = await sf.query(
+      `SELECT CaseNumber, Stage__c, Priority, Compliance_Sensitive__c, Autonomy_Mode__c, Root_Cause__c, Confidence__c, Service_Line__c FROM Case WHERE Id='${caseId}' LIMIT 1`,
+    );
+    const c = res.records[0] || {};
+    const trace = runTraces.get(caseId) || [];
+
+    // "What Was Done" — one bullet per milestone step from each agent/human actor
+    const milestones = trace.filter((s) => s.milestone && s.actorType !== "System");
+    const whatWasDone = milestones.length
+      ? milestones.map((s) => `• ${s.actor}: ${s.action || s.finding || ""}`.trim()).join("\n")
+      : "• No agent actions recorded yet.";
+
+    // "Current Ticket State"
+    const stage = c.Stage__c || "Unknown";
+    const priority = c.Priority || "Unknown";
+    const compliant = c.Compliance_Sensitive__c ? "True" : "False";
+    const autonomy = c.Autonomy_Mode__c || "Unknown";
+    const rootCause = c.Root_Cause__c || "Not yet determined";
+    const confidence = c.Confidence__c != null ? `${c.Confidence__c}%` : null;
+
+    // Closing section based on stage
+    let closing;
+    if (stage === "Closed") {
+      closing = "No Further Action\nThis ticket has been closed.";
+    } else if (stage === "Gated" || autonomy === "Approval" || autonomy === "Inputs Required") {
+      closing = "Awaiting Human Response\nA human operator must review and respond before the agent pipeline can continue.";
+    } else if (stage === "Resolved") {
+      closing = "Next Step\nHandling outbound customer notification via the Communications Agent.";
+    } else {
+      closing = `Next Step\nContinuing resolution pipeline — current stage: ${stage}.`;
+    }
+
+    const body = [
+      `TICKET ${c.CaseNumber || caseId} — COORDINATION STATUS SUMMARY`,
+      "",
+      "What Was Done",
+      whatWasDone,
+      "",
+      "Current Ticket State",
+      `• Stage: ${stage}`,
+      `• Priority: ${priority}`,
+      `• Compliance Sensitive: ${compliant}`,
+      `• Autonomy Mode: ${autonomy}`,
+      `• Root Cause: ${rootCause}`,
+      ...(confidence ? [`• Confidence: ${confidence}`] : []),
+      "",
+      closing,
+    ].join("\n");
+
+    await sf.updateRecord("Case", caseId, { Internal_Comments__c: body });
+    console.log("[INTERNAL COMMENTS] Successfully written for case", caseId);
+  } catch (err) {
+    console.error("[INTERNAL COMMENTS WRITE FAILED] Case", caseId, "—", err.message);
+  }
 }
 
 // Run the Orchestrator on an existing ticket.
@@ -686,7 +752,8 @@ const server = http.createServer(async (req, res) => {
       sendJSON(res, 202, { ok: true });
       const onStep = (e) => wsEmit(sessionId, e);
       orchestrateCase(caseId, sessionId, onStep)
-        .then((out) => {
+        .then(async (out) => {
+          await writeInternalComments(caseId);
           wsEmit(sessionId, { type: "done", trace: runTraces.get(caseId) || [], ...out });
         })
         .catch((e) => {
@@ -791,6 +858,7 @@ const server = http.createServer(async (req, res) => {
         return sendJSON(res, 400, { error: `Unhandled gate op: ${action.op}` });
       }
 
+      if (action.caseId) await writeInternalComments(action.caseId);
       wsEmit(action.sessionId, { type: "done" });
       return sendJSON(res, 200, { ok: true, trace: runTraces.get(action.caseId) || [], ...out });
     }

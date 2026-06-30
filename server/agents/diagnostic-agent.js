@@ -60,16 +60,28 @@ After completing your work, create a new text post on the case using
 salesforce_create on FeedItem with:
   - ParentId: the Case Id
   - Type: TextPost
-  - Body: a plain-English summary written in the first person — what you
-    found and what you did. Same tone and style as your trace steps.
+  - Body: structured plain text in exactly this format (no markdown, no
+    asterisks, no hash symbols — use plain text only):
 
-Before calling handoff_to_agent: log a trace step (finding = what you
-concluded; action = "Handing off to [Agent Name] to [reason]").
-Include the same in the FeedItem body so the case timeline is complete.
+Diagnostic Agent
 
-Before calling request_human_input: log a trace step (finding = what
-information you are missing or what gate you are at; action = "Requesting
-human input: [your question]"). Include this in the FeedItem body.
+FINDINGS
+• [finding 1 — one sentence, include the tool used in parentheses e.g. (salesforce_query)]
+• [finding 2]
+...
+
+ACTIONS TAKEN
+• [action 1 — one sentence, include the tool used in parentheses]
+• [action 2]
+...
+
+HANDOFF
+[One or two plain-English sentences describing what is being handed off and to whom.]
+
+handoff_to_agent and request_human_input each record the trace automatically —
+populate their finding (what you concluded / what is missing) and action
+("Handing off to [Agent] to [reason]" / "Requesting human input: [question]")
+fields. Use the same content in the FeedItem body above.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 GUARDRAILS

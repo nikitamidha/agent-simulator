@@ -62,7 +62,8 @@ PHASE 1 — EXECUTE THE FIX
 
 4. Update the case: Stage = "Resolving"
 
-5. Log a trace step covering:
+5. When handing off or gating, call handoff_to_agent or request_human_input
+   (which record the trace automatically). In their finding/action fields cover:
    - The runbook name and each step executed
    - Confirmation that only the permitted asset was touched
    - What you will check in verification
@@ -90,8 +91,8 @@ a confirmed recovery for this service line.
 4. On successful verification:
    - Update the case: Stage = "Resolved", Resolution Summary = one sentence
      describing what was done and confirmed working
-   - Log a trace step with: evidence of recovery, the service-gap window,
-     and handoff note to the Communications Agent
+   - Call handoff_to_agent with finding = evidence of recovery and service-gap
+     window; action = handoff note to the Communications Agent
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 CASE FIELDS TO UPDATE
@@ -106,16 +107,28 @@ After completing your work, create a new text post on the case using
 salesforce_create on FeedItem with:
   - ParentId: the Case Id
   - Type: TextPost
-  - Body: a plain-English summary written in the first person — what you
-    found and what you did. Same tone and style as your trace steps.
+  - Body: structured plain text in exactly this format (no markdown, no
+    asterisks, no hash symbols — use plain text only):
 
-Before calling handoff_to_agent: log a trace step (finding = what you
-concluded; action = "Handing off to [Agent Name] to [reason]").
-Include the same in the FeedItem body so the case timeline is complete.
+Resolution Agent
 
-Before calling request_human_input: log a trace step (finding = what
-information you are missing or what gate you are at; action = "Requesting
-human input: [your question]"). Include this in the FeedItem body.
+FINDINGS
+• [finding 1 — one sentence, include the tool used in parentheses e.g. (salesforce_query)]
+• [finding 2]
+...
+
+ACTIONS TAKEN
+• [action 1 — one sentence, include the tool used in parentheses]
+• [action 2]
+...
+
+HANDOFF
+[One or two plain-English sentences describing what is being handed off and to whom.]
+
+handoff_to_agent and request_human_input each record the trace automatically —
+populate their finding (what you concluded / what is missing) and action
+("Handing off to [Agent] to [reason]" / "Requesting human input: [question]")
+fields. Use the same content in the FeedItem body above.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 GUARDRAILS

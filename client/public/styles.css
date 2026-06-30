@@ -264,7 +264,7 @@ button.ghost { background: transparent; color: var(--muted); border: 1px solid v
 }
 .ls-actor { font-weight: 600; font-size: 13px; margin-bottom: 6px; }
 .ls-type { font-size: 10px; font-weight: 400; color: var(--muted); text-transform: uppercase; margin-left: 6px; letter-spacing: 0.04em; }
-.ls-action { margin-top: 6px; border-top: 1px solid var(--border); padding-top: 6px; }
+.ls-section { margin-top: 6px; border-top: 1px solid var(--border); padding-top: 6px; }
 .ticket-badge { font-size: 13px; color: var(--accent); font-weight: 600; }
 
 /* Proposed Salesforce writes awaiting approval (human-in-the-loop) */
