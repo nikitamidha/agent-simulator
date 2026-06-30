@@ -419,11 +419,25 @@ function lastUserText(messages) {
   return m ? String(m.content) : "";
 }
 
-function makeExecutor(agent, ctx, proposed, onStep) {
+// Thrown inside makeExecutor to break out of the current agent's chat loop
+// and replace it with a new agent — no reply bubbles back to the caller.
+class HandoffSignal {
+  constructor(target, enrichedTask) {
+    this.target = target;
+    this.enrichedTask = enrichedTask;
+  }
+}
+
+function makeExecutor(agent, ctx, proposed, onStep, initialTask) {
+  const queryLog = [];    // { soql, result }
+  const knowledgeLog = []; // { query, text }
+
   return async (name, input) => {
     if (name === "salesforce_query") {
       const r = await sf.query(input.soql);
-      return JSON.stringify({ totalSize: r.totalSize, records: stripAttributes(r.records) }).slice(0, 8000);
+      const result = JSON.stringify({ totalSize: r.totalSize, records: stripAttributes(r.records) }).slice(0, 8000);
+      queryLog.push({ soql: input.soql, result });
+      return result;
     }
 
     const isWrite = name === "salesforce_create" || name === "salesforce_update";
@@ -446,14 +460,16 @@ function makeExecutor(agent, ctx, proposed, onStep) {
     if (name === "retrieve_knowledge") {
       const k = Math.min(Math.max(1, input.k || 4), 8);
       const hits = retrieve(input.query, { k });
-      if (!hits.length) return "No matching knowledge base sections found for that query.";
-      return hits.map((h, i) => `[${i + 1}] ${h.citation}\n${h.text}`).join("\n\n");
+      const text = hits.length ? hits.map((h, i) => `[${i + 1}] ${h.citation}\n${h.text}`).join("\n\n") : "No matching knowledge base sections found for that query.";
+      if (hits.length) knowledgeLog.push({ query: input.query, text });
+      return text;
     }
 
     if (name === "handoff_to_agent") {
       const target = getAgent(input.agentId);
       if (!target) return `Unknown agent id: ${input.agentId}. Valid ids: diagnostic-agent, intake-agent, resolution-agent, communications-agent.`;
-      // Record the trace step embedded in this call before executing the handoff.
+
+      // Record the trace step before handing off.
       if (ctx.caseId) {
         const lt = input.log_trace || {};
         const { step } = await recordTrace(ctx.caseId, { actor: agent.name, finding: lt.finding, action: lt.action, handoff: lt.handoff, debug: lt.debug, milestone: true });
@@ -466,8 +482,23 @@ function makeExecutor(agent, ctx, proposed, onStep) {
         }
       }
       if (onStep) onStep({ type: "handoff", from: agent.name, to: target.name, caseId: ctx.caseId, task: input.task });
-      const { reply } = await runAgentTask(target, ctx, input.task, onStep);
-      return `[${target.name} response]\n${reply}`;
+
+      // Build enriched task: original context + all gathered data + handoff instruction.
+      const parts = [`[Handed off from: ${agent.name}]`];
+      if (initialTask) parts.push(`Original task:\n${initialTask}`);
+      if (queryLog.length) {
+        parts.push("Salesforce data gathered by prior agent:");
+        queryLog.forEach(({ soql, result }) => parts.push(`Query: ${soql}\nResult: ${result}`));
+      }
+      if (knowledgeLog.length) {
+        parts.push("Knowledge base lookups by prior agent:");
+        knowledgeLog.forEach(({ query, text }) => parts.push(`Query: ${query}\n${text}`));
+      }
+      parts.push(`Handoff instruction:\n${input.task}`);
+      const enrichedTask = parts.join("\n\n");
+
+      // Agent replacement: throw instead of returning — caller's loop terminates.
+      throw new HandoffSignal(target, enrichedTask);
     }
 
     if (name === "request_human_input") {
@@ -514,7 +545,8 @@ function makeExecutor(agent, ctx, proposed, onStep) {
 
 async function runAgentMessages(agent, messages, ctx, proposed, onStep) {
   const tools = SF_ON ? buildTools(agent) : undefined;
-  const executeTool = SF_ON ? makeExecutor(agent, ctx, proposed, onStep) : undefined;
+  const initialTask = messages[0]?.content ?? "";
+  const executeTool = SF_ON ? makeExecutor(agent, ctx, proposed, onStep, initialTask) : undefined;
   const reply = await chat({
     system: buildSystem(agent, ctx),
     messages,
@@ -527,11 +559,25 @@ async function runAgentMessages(agent, messages, ctx, proposed, onStep) {
   return { reply };
 }
 
-// Ephemeral run (orchestrator + specialist activations + approvals).
+// Ephemeral run — agent replacement architecture.
+// When an agent calls handoff_to_agent, a HandoffSignal is thrown which
+// terminates the current agent's loop and starts the next agent fresh.
+// A plaintext reply (no handoff) ends the loop immediately.
 async function runAgentTask(agent, ctx, task, onStep) {
   const proposed = [];
-  const { reply } = await runAgentMessages(agent, [{ role: "user", content: task }], ctx, proposed, onStep);
-  return { reply, sources: [], proposedActions: proposed };
+  while (true) {
+    try {
+      const { reply } = await runAgentMessages(agent, [{ role: "user", content: task }], ctx, proposed, onStep);
+      return { reply, sources: [], proposedActions: proposed };
+    } catch (e) {
+      if (e instanceof HandoffSignal) {
+        agent = e.target;
+        task = e.enrichedTask;
+        continue;
+      }
+      throw e;
+    }
+  }
 }
 
 // Build the run context for an existing Case (account + its assets).

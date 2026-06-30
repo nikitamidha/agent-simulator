@@ -90,6 +90,7 @@ export async function chat({ system, messages, meta, tools, executeTool, maxStep
         try {
           out = await executeTool(block.name, block.input);
         } catch (e) {
+          if (e?.constructor?.name === "HandoffSignal") throw e;
           out = `ERROR: ${e.message}`;
         }
         const preview = toolPreview(block.name, out);
