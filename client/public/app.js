@@ -195,7 +195,8 @@ function handleStreamEvent(event) {
       `<div class="ls-actor"><span class="ls-actor-dot" data-agent="${escapeHtml(dotSlug)}"></span>${escapeHtml(event.actor || "")} <span class="ls-type">${isHuman ? "HUMAN" : "AGENT"}</span></div>` +
       `<div class="md-body">${marked.parse(event.finding || "")}</div>` +
       (event.action ? `<div class="md-body ls-section">${marked.parse(event.action)}</div>` : "") +
-      (event.handoff ? `<div class="md-body ls-section">${marked.parse(event.handoff)}</div>` : "");
+      (event.handoff ? `<div class="md-body ls-section">${marked.parse(event.handoff)}</div>` : "") +
+      (event.hitl_message ? `<div class="comms-draft-card"><div class="comms-draft-label">📨 Drafted Customer Communication — Pending Approval</div><div class="md-body comms-draft-body">${marked.parse(event.hitl_message)}</div></div>` : "");
     runBody.appendChild(card);
     if (currentThinkingBlock) currentThinkingBlock.open = false;
     currentThinkingBlock = null;
@@ -379,6 +380,7 @@ function renderHistoricalRun({ meta, trace, sfLogs, snapshot }) {
           `<div class="md-body">${marked.parse(r.finding || "")}</div>` +
           (r.action ? `<div class="md-body ls-section">${marked.parse(r.action)}</div>` : "") +
           (r.handoff ? `<div class="md-body ls-section">${marked.parse(r.handoff)}</div>` : "") +
+          (r.hitl_message ? `<div class="comms-draft-card"><div class="comms-draft-label">📨 Drafted Customer Communication — Pending Approval</div><div class="md-body comms-draft-body">${marked.parse(r.hitl_message)}</div></div>` : "") +
           `</div>`;
       }).join("") + `<div class="run-complete-marker">✓ Run complete</div>`
     : `<div class="empty">No trace recorded for this run.</div>`;

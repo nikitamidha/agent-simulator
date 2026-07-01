@@ -28,7 +28,7 @@ import { customers as mockCustomers } from "./database.js";
 import { chat, usingRealModel } from "./llm.js";
 import { retrieve, knowledgeStats } from "./knowledge.js";
 import * as sf from "./salesforce.js";
-import { writeFile, mkdir } from "node:fs/promises";
+import { writeFile, mkdir, readdir, readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
@@ -51,6 +51,59 @@ const runTraces = new Map();    // caseId -> [ trace rows ]
 const runMeta = new Map();      // caseId -> { caseNumber, account, serviceLine, createdAt, url }
 const runSfLogs = new Map();    // caseId -> [ sf_write events ]
 const runSnapshots = new Map(); // caseId -> snapshot markdown string
+
+// Persist meta + snapshot to disk so the runs dropdown survives server restarts.
+async function setRunMeta(caseId, meta) {
+  runMeta.set(caseId, meta);
+  try {
+    await writeFile(join(RUNS_DIR, `${caseId}.meta.json`), JSON.stringify(meta, null, 2));
+  } catch {}
+}
+async function setRunSnapshot(caseId, snapshot) {
+  runSnapshots.set(caseId, snapshot);
+  const meta = runMeta.get(caseId) || {};
+  await setRunMeta(caseId, { ...meta, snapshot });
+}
+
+// Hydrate in-memory maps from files written by previous server runs.
+async function loadRunsFromDisk() {
+  try {
+    const files = await readdir(RUNS_DIR);
+    for (const file of files) {
+      if (!file.endsWith('.json') || file.endsWith('.meta.json')) continue;
+      const caseId = file.slice(0, -5);
+      if (!runTraces.has(caseId)) {
+        try {
+          const trace = JSON.parse(await readFile(join(RUNS_DIR, file), 'utf8'));
+          runTraces.set(caseId, Array.isArray(trace) ? trace : []);
+        } catch {}
+      }
+      if (!runMeta.has(caseId)) {
+        try {
+          const meta = JSON.parse(await readFile(join(RUNS_DIR, `${caseId}.meta.json`), 'utf8'));
+          runMeta.set(caseId, meta);
+          if (meta.snapshot) runSnapshots.set(caseId, meta.snapshot);
+        } catch {
+          // No meta file — try to extract CaseNumber from the trace's first System step
+          const trace = runTraces.get(caseId) || [];
+          const firstStep = trace.find(r => r.actorType === 'System') || trace[0];
+          const action = firstStep?.action || firstStep?.finding || '';
+          const caseNumMatch = action.match(/\b(\d{8})\b/);
+          const slMatch = action.match(/\b(CCTV|Network|Web Hosting)\b/i);
+          runMeta.set(caseId, {
+            caseNumber: caseNumMatch ? caseNumMatch[1] : undefined,
+            serviceLine: slMatch ? slMatch[1] : undefined,
+            createdAt: firstStep?.ts || null,
+          });
+        }
+      }
+    }
+    console.log(`[runs] Loaded ${runMeta.size} run(s) from disk.`);
+  } catch (e) {
+    console.warn('[runs] Could not load runs from disk:', e.message);
+  }
+}
+await loadRunsFromDisk();
 
 // Anonymous-Apex demo reset script (repo root scripts/seed-demo.apex).
 const SEED_SCRIPT_PATH =
@@ -515,8 +568,8 @@ function makeExecutor(agent, ctx, proposed, onStep, initialTask) {
       // Record the trace step before blocking.
       if (ctx.caseId) {
         const lt = input.log_trace || {};
-        const { step } = await recordTrace(ctx.caseId, { actor: agent.name, finding: lt.finding, action: lt.action, handoff: lt.handoff, debug: lt.debug, milestone: true });
-        if (onStep) onStep({ type: "trace_step", step, actor: agent.name, actorType: "Agent", finding: lt.finding, action: lt.action, handoff: lt.handoff });
+        const { step } = await recordTrace(ctx.caseId, { actor: agent.name, finding: lt.finding, action: lt.action, handoff: lt.handoff, debug: lt.debug, milestone: true, hitl_message: input.message });
+        if (onStep) onStep({ type: "trace_step", step, actor: agent.name, actorType: "Agent", finding: lt.finding, action: lt.action, handoff: lt.handoff, hitl_message: input.message });
         if (SF_ON) {
           const stripMd = (s = "") => s.replace(/^#{1,6}\s+/gm, "").replace(/\*\*(.+?)\*\*/g, "$1").replace(/\*(.+?)\*/g, "$1").replace(/^[-*]\s+/gm, "• ").replace(/\[tool:[^\]]+\]/g, "").trim();
           const feedBody = `[${agent.name}]\nFinding: ${stripMd(lt.finding)}\nAction: ${stripMd(lt.action)}`;
@@ -867,7 +920,7 @@ const server = http.createServer(async (req, res) => {
       if (!acct) return sendJSON(res, 400, { error: "No account to attach the ticket to." });
 
       const tk = await createCaseFromEvent(event, acct);
-      runMeta.set(tk.caseId, { caseNumber: tk.caseNumber, account: tk.account, serviceLine: tk.serviceLine, createdAt: new Date().toISOString(), url: tk.url });
+      await setRunMeta(tk.caseId, { caseNumber: tk.caseNumber, account: tk.account, serviceLine: tk.serviceLine, createdAt: new Date().toISOString(), url: tk.url });
       await recordTrace(tk.caseId, {
         actor: "Simulator",
         actorType: "System",
@@ -898,7 +951,7 @@ const server = http.createServer(async (req, res) => {
       orchestrateCase(caseId, sessionId, onStep)
         .then(async (out) => {
           const summary = await writeInternalComments(caseId);
-          if (summary) runSnapshots.set(caseId, summary);
+          if (summary) await setRunSnapshot(caseId, summary);
           wsEmit(sessionId, { type: "done", trace: runTraces.get(caseId) || [], ...out, reply: summary || out.reply });
         })
         .catch((e) => {
@@ -987,7 +1040,7 @@ const server = http.createServer(async (req, res) => {
       }
 
       const summary = action.caseId ? await writeInternalComments(action.caseId) : undefined;
-      if (summary && action.caseId) runSnapshots.set(action.caseId, summary);
+      if (summary && action.caseId) await setRunSnapshot(action.caseId, summary);
       wsEmit(action.sessionId, { type: "done", trace: runTraces.get(action.caseId) || [], ...out, reply: summary || out?.reply });
       return sendJSON(res, 200, { ok: true, trace: runTraces.get(action.caseId) || [], ...out });
     }
