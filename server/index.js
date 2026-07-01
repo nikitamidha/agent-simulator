@@ -47,7 +47,10 @@ const INTAKE_AGENT = AGENTS.find((a) => a.id === "intake-agent");
 // via log_trace_step → Agent_Action_Log__c and FeedItem — no harness toggle needed.
 const RUNS_DIR = join(dirname(fileURLToPath(import.meta.url)), "..", "runs");
 await mkdir(RUNS_DIR, { recursive: true });
-const runTraces = new Map(); // caseId -> [ trace rows ]
+const runTraces = new Map();    // caseId -> [ trace rows ]
+const runMeta = new Map();      // caseId -> { caseNumber, account, serviceLine, createdAt, url }
+const runSfLogs = new Map();    // caseId -> [ sf_write events ]
+const runSnapshots = new Map(); // caseId -> snapshot markdown string
 
 // Anonymous-Apex demo reset script (repo root scripts/seed-demo.apex).
 const SEED_SCRIPT_PATH =
@@ -525,7 +528,7 @@ function makeExecutor(agent, ctx, proposed, onStep, initialTask) {
       const id = "input_" + Math.random().toString(36).slice(2, 9);
       if (onStep) onStep({ type: "human_input_requested", agent: agent.name, caseId: ctx.caseId, message: input.message, urgency: input.urgency || "Medium", id });
       const answer = await new Promise((resolve) => {
-        pendingHumanInputs.set(id, { resolve, sessionId: ctx.sessionId, caseId: ctx.caseId });
+        pendingHumanInputs.set(id, { resolve, sessionId: ctx.sessionId, caseId: ctx.caseId, agentId: agent.id });
       });
       if (onStep) onStep({ type: "human_input_answered", id, answer });
       return answer;
@@ -644,14 +647,19 @@ async function writeInternalComments(caseId) {
       }
     }
 
-    // "What Was Done" — one bullet per milestone agent step using the handoff
-    // one-liner (already a clean summary). Full detail is in the trace below.
+    // "What Was Done" — one bullet per milestone step. Skip steps with no content.
+    // Human steps are labelled "Human-in-the-Loop Response".
     const milestones = trace.filter((s) => s.milestone && s.actorType !== "System");
     const whatWasDone = milestones.length
       ? milestones.map((s) => {
-          const summary = s.handoff || s.action?.split("\n")[0] || s.finding?.split("\n")[0] || "";
-          return `- **${s.actor}**: ${summary.replace(/^#+\s*/, "").replace(/\*\*/g, "")}`;
-        }).join("\n")
+          const isHuman = s.actorType === "Human";
+          const label = isHuman ? "Human-in-the-Loop Response" : s.actor;
+          const summary = isHuman
+            ? (s.action || s.finding || "").replace(/^#+\s*/gm, "").trim()
+            : (s.handoff || s.action?.split("\n")[0] || s.finding?.split("\n")[0] || "").replace(/^#+\s*/, "").replace(/\*\*/g, "").trim();
+          if (!summary) return null; // skip empty steps (e.g. agent that didn't populate trace)
+          return `- **${label}**: ${summary}`;
+        }).filter(Boolean).join("\n") || "_No agent actions recorded yet._"
       : "_No agent actions recorded yet._";
 
     const stage = c.Stage__c || "Unknown";
@@ -662,35 +670,42 @@ async function writeInternalComments(caseId) {
     const rootCause = c.Root_Cause__c || "Not yet determined";
     const confidence = c.Confidence__c != null ? `${c.Confidence__c}%` : null;
 
+    let statusEmoji;
+    if (stage === "Closed") statusEmoji = "✅";
+    else if (stage === "Gated") statusEmoji = "⏳";
+    else if (stage === "Resolved") statusEmoji = "🟢";
+    else if (stage === "Resolving") statusEmoji = "🔧";
+    else if (stage === "Diagnosing") statusEmoji = "🔍";
+    else if (stage === "Triaged") statusEmoji = "📋";
+    else statusEmoji = "🔵";
+
     let closing;
     if (stage === "Closed") {
-      closing = "### No Further Action\nThis ticket has been closed.";
+      closing = "### ✅ No Further Action\nThis case has been closed.";
     } else if (stage === "Gated" || autonomy === "Approval" || autonomy === "Inputs Required") {
-      closing = "### Awaiting Human Response\nA human operator must review and respond before the agent pipeline can continue.";
+      closing = "### ⏳ Awaiting Human Response\nA human operator must review and respond before the agent pipeline can continue.";
     } else if (stage === "Resolved") {
-      closing = "### Next Step\nHandling outbound customer notification via the Communications Agent.";
+      closing = "### 🟢 Next Step\nHandling outbound customer notification via the Communications Agent.";
     } else {
-      closing = `### Next Step\nContinuing resolution pipeline — current stage: **${stage}**.`;
+      closing = `### 🔵 Next Step\nContinuing resolution pipeline — current stage: **${stage}**.`;
     }
 
     body = [
-      `## Ticket ${c.CaseNumber || caseId} — Coordination Status Summary`,
+      `## Case ${c.CaseNumber || caseId} — Snapshot`,
+      "",
+      "### Current Case State",
+      "",
+      `- **Stage:** ${statusEmoji} ${stage}`,
+      `- **Priority:** ${priority}`,
+      `- **Service Line:** ${serviceLine}`,
+      `- **Compliance Sensitive:** ${compliant}`,
+      `- **Autonomy Mode:** ${autonomy}`,
+      `- **Root Cause:** ${rootCause}`,
+      ...(confidence ? [`- **Confidence:** ${confidence}`] : []),
       "",
       "### What Was Done",
       "",
       whatWasDone,
-      "",
-      "### Current Ticket State",
-      "",
-      `| Field | Value |`,
-      `|---|---|`,
-      `| Stage | ${stage} |`,
-      `| Priority | ${priority} |`,
-      `| Service Line | ${serviceLine} |`,
-      `| Compliance Sensitive | ${compliant} |`,
-      `| Autonomy Mode | ${autonomy} |`,
-      `| Root Cause | ${rootCause} |`,
-      ...(confidence ? [`| Confidence | ${confidence} |`] : []),
       "",
       closing,
     ].join("\n");
@@ -798,8 +813,28 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "POST" && url.pathname === "/api/reset-org") {
       if (!SF_ON) return sendJSON(res, 400, { error: "Salesforce not configured." });
       await sf.runApex(SEED_SCRIPT_PATH);
-      runTraces.clear(); // local traces point at now-deleted cases
+      runTraces.clear();
+      runMeta.clear();
+      runSfLogs.clear();
+      runSnapshots.clear();
       return sendJSON(res, 200, { ok: true, message: "Org reset to demo data (48 records)." });
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/runs") {
+      const runs = [...runMeta.entries()].map(([caseId, meta]) => ({ caseId, ...meta }));
+      runs.sort((a, b) => (b.createdAt || "").localeCompare(a.createdAt || ""));
+      return sendJSON(res, 200, { runs });
+    }
+
+    if (req.method === "GET" && url.pathname.startsWith("/api/runs/")) {
+      const caseId = url.pathname.slice("/api/runs/".length);
+      if (!caseId) return sendJSON(res, 400, { error: "caseId required" });
+      return sendJSON(res, 200, {
+        meta: runMeta.get(caseId) || {},
+        trace: runTraces.get(caseId) || [],
+        sfLogs: runSfLogs.get(caseId) || [],
+        snapshot: runSnapshots.get(caseId) || null,
+      });
     }
 
     if (req.method === "GET" && url.pathname === "/api/trace") {
@@ -832,6 +867,7 @@ const server = http.createServer(async (req, res) => {
       if (!acct) return sendJSON(res, 400, { error: "No account to attach the ticket to." });
 
       const tk = await createCaseFromEvent(event, acct);
+      runMeta.set(tk.caseId, { caseNumber: tk.caseNumber, account: tk.account, serviceLine: tk.serviceLine, createdAt: new Date().toISOString(), url: tk.url });
       await recordTrace(tk.caseId, {
         actor: "Simulator",
         actorType: "System",
@@ -850,10 +886,19 @@ const server = http.createServer(async (req, res) => {
       const { caseId, sessionId } = await readBody(req);
       if (!caseId || !sessionId) return sendJSON(res, 400, { error: "caseId and sessionId required" });
       sendJSON(res, 202, { ok: true });
-      const onStep = (e) => wsEmit(sessionId, e);
+      const onStep = (e) => {
+        if (e.type === "sf_write") {
+          const key = e.caseId || caseId;
+          const logs = runSfLogs.get(key) || [];
+          logs.push({ ...e, ts: new Date().toISOString() });
+          runSfLogs.set(key, logs);
+        }
+        wsEmit(sessionId, e);
+      };
       orchestrateCase(caseId, sessionId, onStep)
         .then(async (out) => {
           const summary = await writeInternalComments(caseId);
+          if (summary) runSnapshots.set(caseId, summary);
           wsEmit(sessionId, { type: "done", trace: runTraces.get(caseId) || [], ...out, reply: summary || out.reply });
         })
         .catch((e) => {
@@ -877,7 +922,17 @@ const server = http.createServer(async (req, res) => {
       action.status = decision;
       const agent = getAgent(action.agentId);
       const ctx = { sessionId: action.sessionId, caseId: action.caseId, accountId: action.accountId };
-      const onStep = (e) => wsEmit(action.sessionId, e);
+      const onStep = (e) => {
+        if (e.type === "sf_write") {
+          const key = e.caseId || action.caseId;
+          if (key) {
+            const logs = runSfLogs.get(key) || [];
+            logs.push({ ...e, ts: new Date().toISOString() });
+            runSfLogs.set(key, logs);
+          }
+        }
+        wsEmit(action.sessionId, e);
+      };
       let out;
 
       // ── SF write gate (Approval) ──────────────────────────────────────────
@@ -932,6 +987,7 @@ const server = http.createServer(async (req, res) => {
       }
 
       const summary = action.caseId ? await writeInternalComments(action.caseId) : undefined;
+      if (summary && action.caseId) runSnapshots.set(action.caseId, summary);
       wsEmit(action.sessionId, { type: "done", trace: runTraces.get(action.caseId) || [], ...out, reply: summary || out?.reply });
       return sendJSON(res, 200, { ok: true, trace: runTraces.get(action.caseId) || [], ...out });
     }
@@ -956,6 +1012,42 @@ const server = http.createServer(async (req, res) => {
           milestone: true,
         });
       }
+
+      // If the comms agent got an approval, mock-send the email to the account contact.
+      if (pending.agentId === "communications-agent" && /approv|yes|send/i.test(answer) && pending.caseId && SF_ON) {
+        try {
+          const caseRes = await sf.query(`SELECT AccountId FROM Case WHERE Id = '${pending.caseId}' LIMIT 1`);
+          const caseRec = caseRes.records && caseRes.records[0];
+          if (caseRec?.AccountId) {
+            const contactRes = await sf.query(`SELECT Name, Email FROM Contact WHERE AccountId = '${caseRec.AccountId}' LIMIT 1`);
+            const contact = contactRes.records && contactRes.records[0];
+            const recipientLabel = contact
+              ? `${contact.Name} <${contact.Email || "no-email-on-file"}>`
+              : "Account primary contact (email not on file)";
+            await recordTrace(pending.caseId, {
+              actor: "Communications Agent",
+              actorType: "Agent",
+              finding: `Human approved the outbound communication. Mock email dispatched.`,
+              action: `📧 **Mock Send** → ${recipientLabel}\n\nThe drafted customer communication has been queued for delivery. (Simulated — no real email sent.)`,
+              milestone: true,
+            });
+            if (pending.sessionId) {
+              wsEmit(pending.sessionId, {
+                type: "trace_step",
+                agent: "Communications Agent",
+                actor: "Communications Agent",
+                actorType: "Agent",
+                finding: `Human approved. Mock email dispatched to ${recipientLabel}.`,
+                action: `📧 Mock Send — simulated delivery to ${recipientLabel}.`,
+                step: 99,
+              });
+            }
+          }
+        } catch (e) {
+          console.error("[MOCK EMAIL] Failed to look up contact:", e.message);
+        }
+      }
+
       pending.resolve(answer);
       return sendJSON(res, 200, { ok: true });
     }

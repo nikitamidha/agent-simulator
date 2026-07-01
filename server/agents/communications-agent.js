@@ -76,8 +76,11 @@ WHAT YOU DO
 4. Queue the draft for human approval:
    - Store the draft on the case record
    - Set Stage = "Gated", Autonomy Mode = "Approval"
-   - Call request_human_input with finding = draft content summary and
-     why it is gated; action = who needs to approve it
+   - Call request_human_input where:
+       message = the COMPLETE drafted communication text verbatim (so the
+                 operator can read it in full before approving)
+       finding = one-sentence summary of what is being gated and why
+       action  = who needs to approve it and what they should check
 
 5. STOP. Do not close the case. Do not claim the message was sent.
 

@@ -45,7 +45,7 @@ const els = {
   modelBadge: document.getElementById("model-badge"),
   resetOrgBtn: document.getElementById("reset-org-btn"),
   agentList: document.getElementById("agent-list"),
-  customerList: document.getElementById("customer-list"),
+  runSelector: document.getElementById("run-selector"),
   activeName: document.getElementById("active-agent-name"),
   activeMode: document.getElementById("active-agent-mode"),
   messages: document.getElementById("messages"),
@@ -155,7 +155,18 @@ function handleStreamEvent(event) {
   // Human input events are handled regardless of whether a thinking stream is active.
   if (event.type === "human_input_requested") {
     pendingHumanInput = { id: event.id };
-    if (activeAgent) push("agent", event.message || "");
+    if (activeAgent) {
+      const isComms = (event.agent || "").toLowerCase().includes("communications");
+      if (isComms && event.message) {
+        // Show the drafted comms note in a prominent card before the approval prompt.
+        const draftHtml = `<div class="comms-draft-card"><div class="comms-draft-label">📨 Drafted Customer Communication — Pending Approval</div><div class="md-body comms-draft-body">${marked.parse(event.message)}</div></div>`;
+        const list = activeAgent ? transcripts[activeAgent.id] : [];
+        list.push({ role: "_raw_html", html: draftHtml });
+        renderMessages();
+      } else {
+        push("agent", event.message || "");
+      }
+    }
     setHumanInputBanner(true);
     const stepsDiv = agentThinkingSteps(event.agent || "Agent");
     if (stepsDiv) stepsDiv.insertAdjacentHTML("beforeend", `<div class="ts-human-input">🙋 Waiting for operator input</div>`);
@@ -175,9 +186,13 @@ function handleStreamEvent(event) {
   // current thinking block collapses (that agent's step is done).
   if (event.type === "trace_step") {
     const card = document.createElement("div");
+    const agentSlug = (event.agentId || event.agent || "").toLowerCase().replace(/\s+/g, "-");
     card.className = "live-step";
+    card.dataset.agent = agentSlug;
+    const isHuman = agentSlug === "human" || (event.actorType || "").toLowerCase() === "human";
+    const dotSlug = isHuman ? "human" : agentSlug;
     card.innerHTML =
-      `<div class="ls-actor">${escapeHtml(event.actor || "")} <span class="ls-type">AGENT</span></div>` +
+      `<div class="ls-actor"><span class="ls-actor-dot" data-agent="${escapeHtml(dotSlug)}"></span>${escapeHtml(event.actor || "")} <span class="ls-type">${isHuman ? "HUMAN" : "AGENT"}</span></div>` +
       `<div class="md-body">${marked.parse(event.finding || "")}</div>` +
       (event.action ? `<div class="md-body ls-section">${marked.parse(event.action)}</div>` : "") +
       (event.handoff ? `<div class="md-body ls-section">${marked.parse(event.handoff)}</div>` : "");
@@ -261,7 +276,7 @@ els.resetOrgBtn.addEventListener("click", async () => {
       alert("Reset failed: " + data.error);
     } else {
       els.modelBadge.textContent = "Org reset to demo ✓";
-      await loadCustomers(); // accounts changed — refresh the dropdown + panel
+      await loadRuns();
     }
   } catch (e) {
     alert("Reset failed: " + e.message);
@@ -293,7 +308,7 @@ init();
 
 async function init() {
   connectWebSocket();
-  await Promise.all([loadAgents(), loadCustomers()]);
+  await Promise.all([loadAgents(), loadCustomers(), loadRuns()]);
   syncPreset();
 }
 
@@ -315,24 +330,100 @@ async function loadCustomers() {
   try {
     const res = await fetch(`${API}/api/customers`);
     const { customers } = await res.json();
-    els.customerList.innerHTML = customers
-      .map(
-        (c) => `
-        <div class="customer-card">
-          <div class="cname">${escapeHtml(c.name)}</div>
-          <div class="crow">Site: ${escapeHtml(c.deploymentSite)}</div>
-          <div class="crow">Profile: ${escapeHtml(c.deploymentProfile)}</div>
-        </div>`,
-      )
-      .join("");
     els.eventAccount.innerHTML = customers
       .map((c) => `<option value="${escapeHtml(c.id)}">${escapeHtml(c.name)}</option>`)
       .join("");
     const atlas = customers.find((c) => /atlas/i.test(c.name));
     if (atlas) els.eventAccount.value = atlas.id;
     els.injectBtn.disabled = false;
+  } catch (e) {}
+}
+
+async function loadRuns() {
+  try {
+    const res = await fetch(`${API}/api/runs`);
+    const { runs } = await res.json();
+    const prev = els.runSelector.value;
+    els.runSelector.innerHTML = `<option value="">— Select a run —</option>` +
+      runs.map((r) => {
+        const label = r.caseNumber
+          ? `Case ${escapeHtml(r.caseNumber)}${r.account ? " · " + escapeHtml(r.account) : ""}${r.serviceLine ? " [" + escapeHtml(r.serviceLine) + "]" : ""}`
+          : escapeHtml(r.caseId);
+        return `<option value="${escapeHtml(r.caseId)}">${label}</option>`;
+      }).join("");
+    if (prev && runs.find((r) => r.caseId === prev)) els.runSelector.value = prev;
+  } catch (e) {}
+}
+
+els.runSelector.addEventListener("change", async () => {
+  const caseId = els.runSelector.value;
+  if (!caseId) return;
+  try {
+    const res = await fetch(`${API}/api/runs/${encodeURIComponent(caseId)}`);
+    const data = await res.json();
+    renderHistoricalRun(data);
   } catch (e) {
-    els.customerList.innerHTML = `<p class="hint">Could not load customers.</p>`;
+    console.error("Failed to load run:", e);
+  }
+});
+
+function renderHistoricalRun({ meta, trace, sfLogs, snapshot }) {
+  // Agent Run tab — replay trace steps as live-step cards
+  const agentRunHtml = trace.length
+    ? trace.map((r) => {
+        const agentSlug = agentDotSlug(r.actor, r.actorType);
+        const isHuman = agentSlug === "human" || (r.actorType || "").toLowerCase() === "human";
+        const dotSlug = isHuman ? "human" : agentSlug;
+        return `<div class="live-step" data-agent="${escapeHtml(agentSlug)}">` +
+          `<div class="ls-actor"><span class="ls-actor-dot" data-agent="${escapeHtml(dotSlug)}"></span>${escapeHtml(r.actor || "")} <span class="ls-type">${isHuman ? "HUMAN" : "AGENT"}</span></div>` +
+          `<div class="md-body">${marked.parse(r.finding || "")}</div>` +
+          (r.action ? `<div class="md-body ls-section">${marked.parse(r.action)}</div>` : "") +
+          (r.handoff ? `<div class="md-body ls-section">${marked.parse(r.handoff)}</div>` : "") +
+          `</div>`;
+      }).join("") + `<div class="run-complete-marker">✓ Run complete</div>`
+    : `<div class="empty">No trace recorded for this run.</div>`;
+
+  els.messages.innerHTML = agentRunHtml;
+  els.messages.scrollTop = 0;
+
+  // Final Snapshot tab
+  const panel = document.getElementById("final-snapshot");
+  if (snapshot) {
+    panel.innerHTML = `<div class="snapshot-reply md-body">${marked.parse(snapshot)}</div>`;
+    if (trace.length) panel.innerHTML += traceHtml(trace);
+  } else {
+    panel.innerHTML = `<div class="snapshot-empty">No snapshot available for this run yet.</div>`;
+  }
+
+  // SFDC Logs tab — render with the case-specific logs
+  if (sfLogs && sfLogs.length) {
+    els.sfLogs.innerHTML = sfLogs.map((e, i) => {
+      const opLabel = e.op === "salesforce_create" ? "CREATE" : "UPDATE";
+      const opClass = e.op === "salesforce_create" ? "sf-op-create" : "sf-op-update";
+      const fields = JSON.stringify(e.fields || {}, null, 2);
+      const time = new Date(e.ts).toLocaleTimeString();
+      return `<div class="sf-log-entry">
+        <div class="sf-log-header">
+          <span class="sf-log-num">#${i + 1}</span>
+          <span class="sf-op ${opClass}">${opLabel}</span>
+          <strong>${escapeHtml(e.sobject || "")}</strong>
+          ${e.recordId ? `<span class="sf-log-id">${escapeHtml(e.recordId)}</span>` : ""}
+          <span class="sf-log-agent">by ${escapeHtml(e.agent || "")}</span>
+          <span class="sf-log-time">${time}</span>
+        </div>
+        <pre class="sf-log-fields">${escapeHtml(fields)}</pre>
+      </div>`;
+    }).join("");
+  } else {
+    els.sfLogs.innerHTML = `<div class="sf-logs-empty">No Salesforce writes recorded for this run.</div>`;
+  }
+
+  // Switch to Agent Run tab so the user sees the content immediately
+  switchTab("agent-run");
+  // Badge the snapshot tab if we have content
+  if (snapshot) {
+    const snapTab = document.getElementById("snapshot-tab");
+    if (snapTab) snapTab.classList.add("tab-badge");
   }
 }
 
@@ -375,6 +466,7 @@ function renderMessages() {
       .map((m) => {
         if (m.role === "trace") return traceHtml(m.trace);
         if (m.role === "system") return `<div class="msg system">${m.text}</div>`;
+        if (m.role === "_raw_html") return m.html;
         const label = m.role === "user" ? "You" : activeAgent.name;
         const body = m.role === "agent"
           ? `<div class="md-body">${marked.parse(m.text ?? "")}</div>`
@@ -400,17 +492,30 @@ function pushTrace(trace) {
   renderMessages();
 }
 
+function agentDotSlug(actor, actorType) {
+  if ((actorType || "").toLowerCase() === "human") return "human";
+  const n = (actor || "").toLowerCase();
+  if (n.includes("intake")) return "intake-agent";
+  if (n.includes("diagnostic")) return "diagnostic-agent";
+  if (n.includes("resolution")) return "resolution-agent";
+  if (n.includes("communications")) return "communications-agent";
+  return "";
+}
+
 function traceHtml(trace) {
   if (!trace || !trace.length) return "";
   const items = trace
     .map(
-      (r) =>
-        `<li><span class="t-step">${r.step}</span><div class="t-body">` +
-        `<div class="t-actor">${escapeHtml(r.actor || "")} <span class="t-type">${escapeHtml(r.actorType || "Agent")}</span></div>` +
-        `<div class="t-find md-body">${marked.parse(r.finding || "")}</div>` +
-        (r.action ? `<div class="t-act md-body">${marked.parse(r.action)}</div>` : "") +
-        (r.handoff ? `<div class="t-act md-body">${marked.parse(r.handoff)}</div>` : "") +
-        `</div></li>`,
+      (r) => {
+        const slug = agentDotSlug(r.actor, r.actorType);
+        const dot = slug ? `<span class="ls-actor-dot" data-agent="${slug}" style="display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:5px;vertical-align:middle;flex-shrink:0"></span>` : "";
+        return `<li><span class="t-step">${r.step}</span><div class="t-body">` +
+          `<div class="t-actor">${dot}${escapeHtml(r.actor || "")} <span class="t-type">${escapeHtml(r.actorType || "Agent")}</span></div>` +
+          `<div class="t-find md-body">${marked.parse(r.finding || "")}</div>` +
+          (r.action ? `<div class="t-act md-body">${marked.parse(r.action)}</div>` : "") +
+          (r.handoff ? `<div class="t-act md-body">${marked.parse(r.handoff)}</div>` : "") +
+          `</div></li>`;
+      },
     )
     .join("");
   return `<div class="msg trace"><div class="trace-label">🧭 Run trace (local · ${trace.length} steps)</div><ol class="trace-list">${items}</ol></div>`;
@@ -598,9 +703,10 @@ els.injectBtn.addEventListener("click", async () => {
     }
     ticket = data.ticket;
     const caseLink = ticket.url
-      ? `<a href="${escapeHtml(ticket.url)}" target="_blank" rel="noopener">${escapeHtml(ticket.caseNumber)}</a>`
+      ? `<a href="${ticket.url}" target="_blank" rel="noopener">${escapeHtml(ticket.caseNumber)}</a>`
       : escapeHtml(ticket.caseNumber || "");
     push("system", `Event detected. Case ${caseLink} created in Salesforce — starting agent run.`);
+    await loadRuns(); // refresh dropdown with the new case
   } catch (err) {
     push("agent", `Ticket creation failed: ${err.message}`);
     els.injectBtn.disabled = false;
