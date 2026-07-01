@@ -644,22 +644,21 @@ async function writeInternalComments(caseId) {
       }
     }
 
-    // "What Was Done" — one section per milestone agent step with finding + action
+    // "What Was Done" — one bullet per milestone agent step using the handoff
+    // one-liner (already a clean summary). Full detail is in the trace below.
     const milestones = trace.filter((s) => s.milestone && s.actorType !== "System");
     const whatWasDone = milestones.length
       ? milestones.map((s) => {
-          const lines = [`**${s.actor}**`];
-          if (s.finding) lines.push(s.finding);
-          if (s.action) lines.push(s.action);
-          if (s.handoff) lines.push(`*${s.handoff}*`);
-          return lines.join("\n\n");
-        }).join("\n\n---\n\n")
+          const summary = s.handoff || s.action?.split("\n")[0] || s.finding?.split("\n")[0] || "";
+          return `- **${s.actor}**: ${summary.replace(/^#+\s*/, "").replace(/\*\*/g, "")}`;
+        }).join("\n")
       : "_No agent actions recorded yet._";
 
     const stage = c.Stage__c || "Unknown";
     const priority = c.Priority || "Unknown";
     const compliant = c.Compliance_Sensitive__c ? "Yes" : "No";
     const autonomy = c.Autonomy_Mode__c || "Unknown";
+    const serviceLine = c.Service_Line__c || "—";
     const rootCause = c.Root_Cause__c || "Not yet determined";
     const confidence = c.Confidence__c != null ? `${c.Confidence__c}%` : null;
 
@@ -687,6 +686,7 @@ async function writeInternalComments(caseId) {
       `|---|---|`,
       `| Stage | ${stage} |`,
       `| Priority | ${priority} |`,
+      `| Service Line | ${serviceLine} |`,
       `| Compliance Sensitive | ${compliant} |`,
       `| Autonomy Mode | ${autonomy} |`,
       `| Root Cause | ${rootCause} |`,
