@@ -4,8 +4,8 @@
 //  This file assembles the agent registry from individual agent files.
 //
 //  To iterate on a specific agent's prompt, edit ONLY that agent's file:
-//    server/agents/diagnostic-agent.js
 //    server/agents/intake-agent.js
+//    server/agents/diagnostic-agent.js
 //    server/agents/resolution-agent.js
 //    server/agents/communications-agent.js
 //
@@ -13,7 +13,6 @@
 // ============================================================================
 
 import {
-  orchestratorAgent,
   diagnosticAgent,
   intakeAgent,
   resolutionAgent,
@@ -21,9 +20,8 @@ import {
 } from "./agents/index.js";
 
 export const AGENTS = [
-  orchestratorAgent,
-  diagnosticAgent,
   intakeAgent,
+  diagnosticAgent,
   resolutionAgent,
   communicationsAgent,
 ];

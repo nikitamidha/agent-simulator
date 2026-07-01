@@ -144,6 +144,8 @@ h2:first-child { margin-top: 0; }
 .msg.user { align-self: flex-end; background: var(--user); }
 .msg.agent { align-self: flex-start; background: var(--agent); border: 1px solid var(--border); }
 .msg.event { align-self: center; background: var(--event); border: 1px solid #5a4520; color: #f5c878; font-size: 13px; max-width: 90%; }
+.msg.system { align-self: center; background: transparent; border: none; color: var(--muted); font-size: 13px; text-align: center; padding: 6px 0; white-space: normal; max-width: 100%; }
+.msg.system a { color: var(--accent, #7eb8f7); text-decoration: underline; }
 .msg .role { font-size: 11px; color: var(--muted); margin-bottom: 4px; }
 .msg .sources { margin-top: 10px; padding-top: 8px; border-top: 1px dashed var(--border); }
 .msg .sources-label { font-size: 11px; color: var(--muted); margin-bottom: 4px; }

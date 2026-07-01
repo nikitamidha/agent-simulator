@@ -237,6 +237,9 @@ function setHumanInputBanner(show) {
   }
   banner.innerHTML = `<span class="hib-label">Agent is waiting for your reply — type below and press Send</span>`;
   els.chatInput.placeholder = "Type your reply…";
+  els.chatInput.disabled = false;
+  els.chatForm.querySelector("button").disabled = false;
+  els.chatInput.focus();
   els.chatInput.focus();
 }
 
@@ -322,9 +325,6 @@ async function loadCustomers() {
         </div>`,
       )
       .join("");
-
-    // Populate the event Account dropdown (default to Atlas Logistics) and
-    // enable event injection once accounts are loaded.
     els.eventAccount.innerHTML = customers
       .map((c) => `<option value="${escapeHtml(c.id)}">${escapeHtml(c.name)}</option>`)
       .join("");
@@ -342,9 +342,7 @@ function renderAgentList() {
     const btn = document.createElement("button");
     btn.className = "agent-card" + (activeAgent?.id === a.id ? " active" : "");
     btn.innerHTML = `
-      <div class="name">${escapeHtml(a.name)}
-        <span class="mode-chip ${a.mode}">${a.mode === "hitl" ? "human-in-the-loop" : "autonomous"}</span>
-      </div>
+      <div class="name">${escapeHtml(a.name)}</div>
       <div class="desc">${escapeHtml(a.description)}</div>`;
     btn.onclick = () => selectAgent(a);
     els.agentList.appendChild(btn);
@@ -356,8 +354,8 @@ function selectAgent(agent) {
   if (!transcripts[agent.id]) transcripts[agent.id] = [];
   renderAgentList();
   els.activeName.textContent = agent.name;
-  els.activeMode.textContent = agent.mode === "hitl" ? "human-in-the-loop" : "autonomous";
-  els.activeMode.className = "mode-tag " + agent.mode;
+  els.activeMode.textContent = "";
+  els.activeMode.className = "mode-tag";
   els.chatInput.disabled = false;
   els.chatForm.querySelector("button").disabled = false;
   els.injectBtn.disabled = false;
@@ -376,6 +374,7 @@ function renderMessages() {
     els.messages.innerHTML = list
       .map((m) => {
         if (m.role === "trace") return traceHtml(m.trace);
+        if (m.role === "system") return `<div class="msg system">${m.text}</div>`;
         const label = m.role === "user" ? "You" : activeAgent.name;
         const body = m.role === "agent"
           ? `<div class="md-body">${marked.parse(m.text ?? "")}</div>`
@@ -575,9 +574,9 @@ els.injectBtn.addEventListener("click", async () => {
   if (!text) return;
   const accountId = els.eventAccount.value || undefined;
 
-  // The Orchestrator handles the ticket — switch to it so its run shows here.
-  const orch = agents.find((a) => a.role === "orchestrator");
-  if (orch) selectAgent(orch);
+  // Switch to the Intake Agent so its run shows in the chat panel.
+  const intakeAgent = agents.find((a) => a.id === "intake-agent");
+  if (intakeAgent) selectAgent(intakeAgent);
 
   els.injectBtn.disabled = true;
   els.ticketLink.innerHTML = "";
@@ -598,17 +597,17 @@ els.injectBtn.addEventListener("click", async () => {
       return;
     }
     ticket = data.ticket;
-    if (ticket.url)
-      els.ticketLink.innerHTML = `<a href="${ticket.url}" target="_blank" rel="noopener">🎫 ${escapeHtml(ticket.caseNumber)} — open in Salesforce ↗</a>`;
-    else if (ticket.caseNumber)
-      els.ticketLink.innerHTML = `<span class="ticket-badge">🎫 ${escapeHtml(ticket.caseNumber)} created</span>`;
+    const caseLink = ticket.url
+      ? `<a href="${escapeHtml(ticket.url)}" target="_blank" rel="noopener">${escapeHtml(ticket.caseNumber)}</a>`
+      : escapeHtml(ticket.caseNumber || "");
+    push("system", `Event detected. Case ${caseLink} created in Salesforce — starting agent run.`);
   } catch (err) {
     push("agent", `Ticket creation failed: ${err.message}`);
     els.injectBtn.disabled = false;
     return;
   }
 
-  // Step 2 — kick off the Orchestrator run. The server returns 202 immediately;
+  // Step 2 — kick off the agent pipeline run. The server returns 202 immediately;
   // thinking steps and the final result arrive via WebSocket (handleStreamEvent).
   // injectBtn stays disabled until the "done" WS event re-enables it.
   thinking();

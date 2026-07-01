@@ -5,9 +5,10 @@
 //
 //  Flow for an injected event:
 //    inject event (+ accountId) -> create Case (Correlation_Id__c='ITF-…') ->
-//    Orchestrator (manager agent) routes to specialist(s) via activate_agent ->
+//    Intake Agent (first specialist) -> agents hand off directly to each other
+//    via handoff_to_agent (Intake -> Diagnostic -> Resolution -> Comms) ->
 //    specialists read the Case, act, and write trace rows (Agent_Action_Log__c)
-//    via log_trace_step -> stop at the first human-in-the-loop approval gate.
+//    -> stop at the first human-in-the-loop approval gate.
 //  The webapp reads those Case + Agent_Action_Log__c rows live.
 //
 //  Endpoints:
@@ -40,7 +41,7 @@ process.on("unhandledRejection", (reason) => {
 process.on("uncaughtException", (err) => {
   console.error("[uncaughtException]", err);
 });
-const ORCHESTRATOR = AGENTS.find((a) => a.role === "orchestrator");
+const INTAKE_AGENT = AGENTS.find((a) => a.id === "intake-agent");
 
 // Local run traces (memory + disk). SF trace is written by agents themselves
 // via log_trace_step → Agent_Action_Log__c and FeedItem — no harness toggle needed.
@@ -544,7 +545,7 @@ async function runAgentMessages(agent, messages, ctx, proposed, onStep) {
     meta: { name: agent.name, mode: agent.mode },
     tools,
     executeTool,
-    maxSteps: agent.role === "orchestrator" ? 24 : 20,
+    maxSteps: 20,
     onStep,
   });
   return { reply };
@@ -554,14 +555,49 @@ async function runAgentMessages(agent, messages, ctx, proposed, onStep) {
 // When an agent calls handoff_to_agent, a HandoffSignal is thrown which
 // terminates the current agent's loop and starts the next agent fresh.
 // A plaintext reply (no handoff) ends the loop immediately.
+//
+// Loop detection: if the same agent is invoked 3 times in a row without
+// a different agent running in between, something is stuck — the 4th attempt
+// is blocked and a human-input gate is opened instead.
 async function runAgentTask(agent, ctx, task, onStep) {
   const proposed = [];
+  // Track consecutive handoffs to the same agent: { agentId, count }
+  let loopTracker = { agentId: agent.id, count: 1 };
+
   while (true) {
     try {
       const { reply } = await runAgentMessages(agent, [{ role: "user", content: task }], ctx, proposed, onStep);
       return { reply, sources: [], proposedActions: proposed };
     } catch (e) {
       if (e instanceof HandoffSignal) {
+        // Update loop tracker
+        if (e.target.id === loopTracker.agentId) {
+          loopTracker.count += 1;
+        } else {
+          loopTracker = { agentId: e.target.id, count: 1 };
+        }
+
+        if (loopTracker.count > 3) {
+          // Escalate: surface a human-input gate rather than looping forever
+          const gateId = `loop-${Date.now()}`;
+          const gatePayload = {
+            id: gateId,
+            agentId: agent.id,
+            sessionId: ctx.sessionId,
+            caseId: ctx.caseId,
+            accountId: ctx.accountId,
+            op: "human_input",
+            input: {
+              question: `Agent loop detected: "${e.target.name}" has been called ${loopTracker.count} times without stage advancing. Please review the ticket and advise how to proceed.`,
+              context: task,
+            },
+            status: "pending",
+          };
+          pendingActions.set(gateId, gatePayload);
+          if (onStep) onStep({ type: "gate", gate: gatePayload });
+          return { reply: `⚠️ Agent loop detected on ${e.target.name}. Escalated to human review (gate ${gateId}).`, sources: [], proposedActions: proposed };
+        }
+
         agent = e.target;
         task = e.enrichedTask;
         continue;
@@ -590,72 +626,99 @@ async function loadCaseCtx(caseId, sessionId) {
 // Build a plain-text Internal_Comments__c snapshot from live Case state + trace,
 // then write it. Called by the harness after every agent run and HITL response.
 async function writeInternalComments(caseId) {
-  if (!SF_ON) { console.log("[INTERNAL COMMENTS] SF not configured — skipping."); return; }
-  console.log("[INTERNAL COMMENTS] Writing snapshot for case", caseId);
+  // Build the snapshot body from local trace + SF case fields.
+  // The body is always returned so the Final Snapshot tab can display it
+  // even if the Salesforce write fails (e.g. field not provisioned in the org).
+  let body;
   try {
-    const res = await sf.query(
-      `SELECT CaseNumber, Stage__c, Priority, Compliance_Sensitive__c, Autonomy_Mode__c, Root_Cause__c, Confidence__c, Service_Line__c FROM Case WHERE Id='${caseId}' LIMIT 1`,
-    );
-    const c = res.records[0] || {};
     const trace = runTraces.get(caseId) || [];
+    let c = {};
+    if (SF_ON) {
+      try {
+        const res = await sf.query(
+          `SELECT CaseNumber, Stage__c, Priority, Compliance_Sensitive__c, Autonomy_Mode__c, Root_Cause__c, Confidence__c, Service_Line__c FROM Case WHERE Id='${caseId}' LIMIT 1`,
+        );
+        c = res.records[0] || {};
+      } catch (e) {
+        console.warn("[INTERNAL COMMENTS] Could not query Case fields:", e.message);
+      }
+    }
 
-    // "What Was Done" — one bullet per milestone step from each agent/human actor
+    // "What Was Done" — one section per milestone agent step with finding + action
     const milestones = trace.filter((s) => s.milestone && s.actorType !== "System");
     const whatWasDone = milestones.length
-      ? milestones.map((s) => `• ${s.actor}: ${s.action || s.finding || ""}`.trim()).join("\n")
-      : "• No agent actions recorded yet.";
+      ? milestones.map((s) => {
+          const lines = [`**${s.actor}**`];
+          if (s.finding) lines.push(s.finding);
+          if (s.action) lines.push(s.action);
+          if (s.handoff) lines.push(`*${s.handoff}*`);
+          return lines.join("\n\n");
+        }).join("\n\n---\n\n")
+      : "_No agent actions recorded yet._";
 
-    // "Current Ticket State"
     const stage = c.Stage__c || "Unknown";
     const priority = c.Priority || "Unknown";
-    const compliant = c.Compliance_Sensitive__c ? "True" : "False";
+    const compliant = c.Compliance_Sensitive__c ? "Yes" : "No";
     const autonomy = c.Autonomy_Mode__c || "Unknown";
     const rootCause = c.Root_Cause__c || "Not yet determined";
     const confidence = c.Confidence__c != null ? `${c.Confidence__c}%` : null;
 
-    // Closing section based on stage
     let closing;
     if (stage === "Closed") {
-      closing = "No Further Action\nThis ticket has been closed.";
+      closing = "### No Further Action\nThis ticket has been closed.";
     } else if (stage === "Gated" || autonomy === "Approval" || autonomy === "Inputs Required") {
-      closing = "Awaiting Human Response\nA human operator must review and respond before the agent pipeline can continue.";
+      closing = "### Awaiting Human Response\nA human operator must review and respond before the agent pipeline can continue.";
     } else if (stage === "Resolved") {
-      closing = "Next Step\nHandling outbound customer notification via the Communications Agent.";
+      closing = "### Next Step\nHandling outbound customer notification via the Communications Agent.";
     } else {
-      closing = `Next Step\nContinuing resolution pipeline — current stage: ${stage}.`;
+      closing = `### Next Step\nContinuing resolution pipeline — current stage: **${stage}**.`;
     }
 
-    const body = [
-      `TICKET ${c.CaseNumber || caseId} — COORDINATION STATUS SUMMARY`,
+    body = [
+      `## Ticket ${c.CaseNumber || caseId} — Coordination Status Summary`,
       "",
-      "What Was Done",
+      "### What Was Done",
+      "",
       whatWasDone,
       "",
-      "Current Ticket State",
-      `• Stage: ${stage}`,
-      `• Priority: ${priority}`,
-      `• Compliance Sensitive: ${compliant}`,
-      `• Autonomy Mode: ${autonomy}`,
-      `• Root Cause: ${rootCause}`,
-      ...(confidence ? [`• Confidence: ${confidence}`] : []),
+      "### Current Ticket State",
+      "",
+      `| Field | Value |`,
+      `|---|---|`,
+      `| Stage | ${stage} |`,
+      `| Priority | ${priority} |`,
+      `| Compliance Sensitive | ${compliant} |`,
+      `| Autonomy Mode | ${autonomy} |`,
+      `| Root Cause | ${rootCause} |`,
+      ...(confidence ? [`| Confidence | ${confidence} |`] : []),
       "",
       closing,
     ].join("\n");
-
-    await sf.updateRecord("Case", caseId, { Internal_Comments__c: body });
-    console.log("[INTERNAL COMMENTS] Successfully written for case", caseId);
   } catch (err) {
-    console.error("[INTERNAL COMMENTS WRITE FAILED] Case", caseId, "—", err.message);
+    console.error("[INTERNAL COMMENTS BUILD FAILED] Case", caseId, "—", err.message);
+    return;
   }
+
+  // Attempt to persist to Salesforce — failures are logged but don't affect the return value.
+  if (SF_ON) {
+    try {
+      await sf.updateRecord("Case", caseId, { Internal_Comments__c: body });
+      console.log("[INTERNAL COMMENTS] Written to Salesforce for case", caseId);
+    } catch (err) {
+      console.warn("[INTERNAL COMMENTS] SF write skipped (field may not exist):", err.message);
+    }
+  }
+
+  return body;
 }
 
-// Run the Orchestrator on an existing ticket.
+// Run the agent pipeline on an existing ticket, starting with the Intake Agent.
 async function orchestrateCase(caseId, sessionId, onStep) {
   const ctx = await loadCaseCtx(caseId, sessionId);
   return runAgentTask(
-    ORCHESTRATOR,
+    INTAKE_AGENT,
     ctx,
-    `This is a new ticket created with ticket ID ${ctx.caseNumber} (Case Id: ${caseId}). Handle and triage it.`,
+    `This is a new ticket created with ticket ID ${ctx.caseNumber} (Case Id: ${caseId}). Triage and scope this incident, then hand off to the next agent.`,
     onStep,
   );
 }
@@ -773,14 +836,14 @@ const server = http.createServer(async (req, res) => {
         actor: "Simulator",
         actorType: "System",
         finding: `New ticket created from incident report: "${event}".`,
-        action: `Opened ${tk.caseNumber} (service line ${tk.serviceLine || "unclassified"}); notifying the Orchestrator with the Case Id.`,
+        action: `Opened ${tk.caseNumber} (service line ${tk.serviceLine || "unclassified"}); routing to the Intake Agent.`,
         stage: "Detected",
         outcome: "Pending",
       });
       return sendJSON(res, 200, { ticket: tk, trace: runTraces.get(tk.caseId) || [] });
     }
 
-    // Run the Orchestrator on an existing ticket. Returns 202 immediately;
+    // Run the agent pipeline on an existing ticket. Returns 202 immediately;
     // thinking steps and the final result are delivered via WebSocket so
     // the browser fetch never needs to wait for the full agent run.
     if (req.method === "POST" && url.pathname === "/api/run") {
@@ -790,8 +853,8 @@ const server = http.createServer(async (req, res) => {
       const onStep = (e) => wsEmit(sessionId, e);
       orchestrateCase(caseId, sessionId, onStep)
         .then(async (out) => {
-          await writeInternalComments(caseId);
-          wsEmit(sessionId, { type: "done", trace: runTraces.get(caseId) || [], ...out });
+          const summary = await writeInternalComments(caseId);
+          wsEmit(sessionId, { type: "done", trace: runTraces.get(caseId) || [], ...out, reply: summary || out.reply });
         })
         .catch((e) => {
           wsEmit(sessionId, { type: "done", reply: `⚠️ Agent run failed: ${e.message}`, sources: [], proposedActions: [], trace: runTraces.get(caseId) || [] });
@@ -868,8 +931,8 @@ const server = http.createServer(async (req, res) => {
         return sendJSON(res, 400, { error: `Unhandled gate op: ${action.op}` });
       }
 
-      if (action.caseId) await writeInternalComments(action.caseId);
-      wsEmit(action.sessionId, { type: "done" });
+      const summary = action.caseId ? await writeInternalComments(action.caseId) : undefined;
+      wsEmit(action.sessionId, { type: "done", trace: runTraces.get(action.caseId) || [], ...out, reply: summary || out?.reply });
       return sendJSON(res, 200, { ok: true, trace: runTraces.get(action.caseId) || [], ...out });
     }
 

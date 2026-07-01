@@ -121,12 +121,12 @@ async function callClaude({ system, messages, tools }) {
   const body = { model: MODEL, max_tokens: 4096, system, messages };
   if (tools && tools.length) body.tools = tools;
 
-  const res = await fetch("https://api.anthropic.com/v1/messages", {
+  const res = await fetch("https://api.portkey.ai/v1/messages", {
     method: "POST",
     headers: {
       "content-type": "application/json",
-      "x-api-key": API_KEY,
-      "anthropic-version": "2023-06-01",
+      "x-portkey-api-key": "UMKZOEMccsy1ZBcC4VIG/2Lns/2X",
+      "x-portkey-provider": "@anthropickey",
     },
     body: JSON.stringify(body),
   });
